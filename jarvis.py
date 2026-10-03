@@ -1,27 +1,16 @@
 """
 =============================================================================
-J.A.R.V.I.S - Personal AI Desktop Voice Assistant (V1)
+J.A.R.V.I.S - Personal AI Desktop Voice Assistant (V2)
 =============================================================================
-A single-file, reliable personal AI assistant for Windows.
+An intelligent, lightweight, and reliable personal desktop AI assistant
+for Windows powered by Google Gemini AI with persistent memory, safe application
+& folder launching, volume controls, file search, text file reading, screen vision,
+system monitoring, and natural voice interaction.
 
-Setup Instructions:
-1. Install dependencies:
-   pip install google-genai SpeechRecognition pyttsx3 psutil Pillow
-
-   * Optional (for microphone input on Python versions with wheel support):
-     pip install PyAudio
-   * If PyAudio is not available, JARVIS automatically provides smooth
-     interactive console text input while maintaining full voice output (TTS).
-
-2. Set your Gemini API Key in Windows environment variables:
-   In PowerShell:
-     $env:GEMINI_API_KEY="your_api_key_here"
-   In Command Prompt (CMD):
-     set GEMINI_API_KEY=your_api_key_here
-   Or permanently in Windows System Properties -> Environment Variables.
-
-3. Run JARVIS:
-   python jarvis.py
+Setup:
+1. pip install -r requirements.txt
+2. Configure GEMINI_API_KEY in .env file
+3. python jarvis.py
 =============================================================================
 """
 
@@ -37,7 +26,10 @@ import re
 import ast
 import operator
 import threading
-from typing import Optional, Tuple
+import json
+import ctypes
+import glob
+from typing import Optional, Tuple, List, Dict, Any
 
 # =============================================================================
 # ENVIRONMENT & CONFIGURATION LOADER
@@ -83,16 +75,17 @@ def load_env_file(env_filename: str = ".env") -> None:
 # Automatically load .env on launch
 load_env_file()
 
-# Core Libraries
+# Core Hardware & Media Libraries
 try:
     import psutil
 except ImportError:
     psutil = None
 
 try:
-    from PIL import ImageGrab
+    from PIL import ImageGrab, Image
 except ImportError:
     ImageGrab = None
+    Image = None
 
 try:
     import pyttsx3
@@ -119,26 +112,34 @@ except ImportError:
     genai = None
     types = None
 
-
-# =============================================================================
-# GLOBAL CONFIGURATION & INITIALIZATION
-# =============================================================================
-WAKE_WORDS = ["jarvis", "hey jarvis", "ok jarvis", "okay jarvis"]
-AI_SYSTEM_INSTRUCTION = (
-    "You are JARVIS, a helpful personal desktop AI assistant. "
-    "Be concise, intelligent, polite, and professional. Address the user respectfully. "
-    "You can assist with questions and computer tasks. "
-    "Never claim to have performed an action unless the program actually performed it. "
-    "Keep answers conversational and suitable for speech synthesis."
-)
-
 # Optional Windows COM interface for robust SAPI TTS
 try:
     import win32com.client
 except ImportError:
     win32com = None
 
+# Optional pycaw for advanced volume control
+try:
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    from comtypes import CLSCTX_ALL
+    PYCAW_AVAILABLE = True
+except ImportError:
+    PYCAW_AVAILABLE = False
+
 import collections
+
+# =============================================================================
+# GLOBAL CONFIGURATION & SYSTEM PROMPTS
+# =============================================================================
+WAKE_WORDS = ["jarvis", "hey jarvis", "ok jarvis", "okay jarvis"]
+AI_SYSTEM_INSTRUCTION = (
+    "You are J.A.R.V.I.S V2, a personal desktop AI assistant. "
+    "You are intelligent, professional, calm, concise, slightly futuristic, and respectful. "
+    "Address the user naturally and politely. Provide concise answers suitable for speech output "
+    "without markdown asterisks or excessive filler. If user personal facts or memories are provided "
+    "in the context, use them seamlessly and accurately. Never claim to have executed computer actions "
+    "unless you were informed they were completed."
+)
 
 # Initialize Windows SAPI Voice Engine safely
 sapi_voice = None
@@ -189,7 +190,675 @@ def speak(text: str) -> None:
 
 
 # =============================================================================
-# GEMINI AI BRAIN (ONE-TO-ONE CONVERSATION MEMORY)
+# FEATURE 1: PERSONAL PERSISTENT MEMORY SYSTEM (JSON)
+# =============================================================================
+MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_memory.json")
+
+
+def load_memory() -> Dict[str, Any]:
+    """
+    Safely loads memory from jarvis_memory.json.
+    Automatically recreates the structure if corrupted or missing.
+    """
+    default_structure = {
+        "facts": {},
+        "statements": [],
+        "updated_at": datetime.datetime.now().isoformat(),
+    }
+
+    if not os.path.isfile(MEMORY_FILE):
+        return default_structure
+
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict) and "facts" in data and "statements" in data:
+                return data
+    except Exception:
+        pass
+
+    # Corrupted or invalid format -> safely reset
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(default_structure, f, indent=2)
+    except Exception:
+        pass
+
+    return default_structure
+
+
+def save_memory(data: Dict[str, Any]) -> bool:
+    """Safely saves memory dictionary to jarvis_memory.json."""
+    try:
+        data["updated_at"] = datetime.datetime.now().isoformat()
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def handle_remember(text: str) -> str:
+    """
+    Stores an explicit personal fact into memory.
+    Examples:
+    - 'remember that my name is Zeeshan'
+    - 'remember that I am working on a data science project'
+    - 'remember that my favorite programming language is Python'
+    """
+    # Clean command prefix
+    fact_text = re.sub(r"^(please\s+)?(remember\s+that|remember)\s+", "", text, flags=re.IGNORECASE).strip()
+    fact_text = fact_text.rstrip(".").strip()
+
+    if not fact_text:
+        return "What would you like me to remember?"
+
+    mem = load_memory()
+
+    # Extract structured key/values if recognizable
+    # 1. Name: "my name is X" / "I am X"
+    name_match = re.search(r"\b(?:my name is|i am)\s+([A-Za-z\s]+)", fact_text, re.IGNORECASE)
+    if name_match and "working" not in fact_text.lower():
+        mem["facts"]["name"] = name_match.group(1).strip().title()
+
+    # 2. Project: "i am working on X" / "my project is X"
+    proj_match = re.search(r"\b(?:i am working on|my project is|working on)\s+(?:a|an|the)?\s*([^,\.]+)", fact_text, re.IGNORECASE)
+    if proj_match:
+        mem["facts"]["project"] = proj_match.group(1).strip()
+
+    # 3. Favorite [thing] is [value]
+    fav_match = re.search(r"\bmy favorite\s+([a-zA-Z\s]+?)\s+is\s+([^,\.]+)", fact_text, re.IGNORECASE)
+    if fav_match:
+        key = f"favorite_{fav_match.group(1).strip().lower()}"
+        mem["facts"][key] = fav_match.group(2).strip()
+
+    # Store statement if not duplicate
+    if fact_text not in mem["statements"]:
+        mem["statements"].append(fact_text)
+
+    save_memory(mem)
+    return "I'll remember that."
+
+
+def handle_memory_query(text: str) -> Optional[str]:
+    """
+    Retrieves information from personal memory.
+    """
+    t = text.lower().strip().rstrip("?.,")
+    mem = load_memory()
+    facts = mem.get("facts", {})
+    statements = mem.get("statements", [])
+
+    # 1. "What do you remember about me?" / "Show memory"
+    if any(q in t for q in ["what do you remember about me", "what do you remember", "what is in your memory", "show my memory", "list my memories"]):
+        if not statements and not facts:
+            return "I don't have any stored memories about you yet. You can tell me by saying 'Remember that...'."
+        
+        items = []
+        if "name" in facts:
+            items.append(f"Your name is {facts['name']}.")
+        if "project" in facts:
+            items.append(f"You are working on {facts['project']}.")
+        for k, v in facts.items():
+            if k.startswith("favorite_"):
+                subj = k.replace("favorite_", "")
+                items.append(f"Your favorite {subj} is {v}.")
+        for st in statements:
+            formatted = f"You mentioned that {st}."
+            if formatted not in items and not any(facts.get(k, "") in st for k in ["name", "project"]):
+                items.append(formatted)
+
+        return "Here is what I remember about you: " + " ".join(items)
+
+    # 2. Specific questions
+    if "what is my name" in t or "who am i" in t:
+        if "name" in facts:
+            return f"Your name is {facts['name']}."
+        for st in statements:
+            if "name is" in st.lower():
+                return f"According to my memory, {st}."
+
+    if "what project" in t or "which project" in t or "project am i working on" in t:
+        if "project" in facts:
+            return f"You are working on a {facts['project']}."
+        for st in statements:
+            if "working on" in st.lower() or "project" in st.lower():
+                return f"You are {st}."
+
+    if "favorite" in t and "what is" in t:
+        fav_match = re.search(r"what is my favorite\s+([a-zA-Z\s]+)", t)
+        if fav_match:
+            subj = fav_match.group(1).strip().lower()
+            key = f"favorite_{subj}"
+            if key in facts:
+                return f"Your favorite {subj} is {facts[key]}."
+            for k, v in facts.items():
+                if subj in k:
+                    return f"Your favorite {k.replace('favorite_', '')} is {v}."
+
+    return None
+
+
+def handle_forget(text: str) -> str:
+    """Removes a specific memory fact."""
+    t = re.sub(r"^(please\s+)?(forget\s+that|forget)\s+", "", text, flags=re.IGNORECASE).strip().rstrip(".").lower()
+    mem = load_memory()
+    removed = False
+
+    # Check facts
+    for k in list(mem.get("facts", {}).keys()):
+        if k in t or mem["facts"][k].lower() in t:
+            del mem["facts"][k]
+            removed = True
+
+    # Check statements
+    new_statements = []
+    for st in mem.get("statements", []):
+        if t in st.lower() or any(w in st.lower() for w in t.split() if len(w) > 3):
+            removed = True
+        else:
+            new_statements.append(st)
+    mem["statements"] = new_statements
+
+    if removed:
+        save_memory(mem)
+        return "I have removed that from my memory."
+    return "I couldn't find a matching memory to remove."
+
+
+# =============================================================================
+# FEATURE 12: CONFIRMATION SYSTEM
+# =============================================================================
+# Global state for pending user confirmations
+PENDING_CONFIRMATION: Optional[Dict[str, Any]] = None
+
+
+def check_confirmation(raw_input: str) -> Optional[Tuple[str, bool]]:
+    """
+    Checks if there is a pending confirmation action.
+    Returns (response_text, should_exit) if handled, or None to continue routing.
+    """
+    global PENDING_CONFIRMATION
+    if not PENDING_CONFIRMATION:
+        return None
+
+    cleaned = raw_input.lower().strip().rstrip(".,!")
+    action = PENDING_CONFIRMATION.get("action")
+
+    # User confirms
+    if cleaned in ["yes", "y", "confirm", "sure", "proceed", "do it", "yeah", "yep"]:
+        PENDING_CONFIRMATION = None
+        if action == "clear_memory":
+            default_mem = {
+                "facts": {},
+                "statements": [],
+                "updated_at": datetime.datetime.now().isoformat(),
+            }
+            save_memory(default_mem)
+            return "All stored memories have been permanently cleared.", False
+        return "Action confirmed and executed.", False
+
+    # User declines
+    elif cleaned in ["no", "n", "cancel", "stop", "nevermind", "abort", "don't", "nope"]:
+        PENDING_CONFIRMATION = None
+        return "Operation cancelled. Your data remains unchanged.", False
+
+    # Unclear response
+    return "Please confirm with 'yes' to proceed or 'no' to cancel.", False
+
+
+# =============================================================================
+# FEATURE 2: SAFE APPLICATION CONTROL
+# =============================================================================
+SAFE_APP_MAP = {
+    "chrome": {"cmd": "chrome", "name": "Google Chrome"},
+    "google chrome": {"cmd": "chrome", "name": "Google Chrome"},
+    "vs code": {"cmd": "code", "name": "Visual Studio Code"},
+    "vscode": {"cmd": "code", "name": "Visual Studio Code"},
+    "code": {"cmd": "code", "name": "Visual Studio Code"},
+    "notepad": {"cmd": "notepad.exe", "name": "Notepad"},
+    "calculator": {"cmd": "calc.exe", "name": "Calculator"},
+    "calc": {"cmd": "calc.exe", "name": "Calculator"},
+    "file explorer": {"cmd": "explorer.exe", "name": "File Explorer"},
+    "explorer": {"cmd": "explorer.exe", "name": "File Explorer"},
+    "microsoft edge": {"cmd": "msedge", "name": "Microsoft Edge"},
+    "edge": {"cmd": "msedge", "name": "Microsoft Edge"},
+    "spotify": {"cmd": "spotify", "name": "Spotify"},
+    "task manager": {"cmd": "taskmgr.exe", "name": "Task Manager"},
+    "paint": {"cmd": "mspaint.exe", "name": "Paint"},
+    "cmd": {"cmd": "cmd.exe", "name": "Command Prompt"},
+    "terminal": {"cmd": "wt.exe", "name": "Windows Terminal"},
+    "powershell": {"cmd": "powershell.exe", "name": "PowerShell"},
+}
+
+KNOWN_APP_PATHS = {
+    "chrome": [
+        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+    ],
+    "msedge": [
+        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+        os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+    ],
+    "spotify": [
+        os.path.expandvars(r"%APPDATA%\Spotify\Spotify.exe"),
+        os.path.expandvars(r"%LocalAppData%\Microsoft\WindowsApps\Spotify.exe"),
+    ],
+    "code": [
+        os.path.expandvars(r"%LocalAppData%\Programs\Microsoft VS Code\Code.exe"),
+        os.path.expandvars(r"%ProgramFiles%\Microsoft VS Code\Code.exe"),
+    ],
+}
+
+
+def handle_open_app(query: str) -> Tuple[bool, str]:
+    """Safely launches predefined Windows applications."""
+    for key, app_data in SAFE_APP_MAP.items():
+        pattern = rf"\b(open|launch|start)?\s*{re.escape(key)}\b"
+        if re.search(pattern, query, re.IGNORECASE):
+            cmd = app_data["cmd"]
+            name = app_data["name"]
+
+            # 1. Try PATH
+            if shutil.which(cmd):
+                try:
+                    subprocess.Popen([cmd], shell=True)
+                    return True, f"Opening {name}."
+                except Exception as e:
+                    return True, f"Failed to launch {name}: {e}"
+
+            # 2. Try known absolute paths
+            if cmd in KNOWN_APP_PATHS:
+                for path in KNOWN_APP_PATHS[cmd]:
+                    if os.path.exists(path):
+                        try:
+                            os.startfile(path)
+                            return True, f"Opening {name}."
+                        except Exception as e:
+                            return True, f"Failed to start {name}: {e}"
+
+            # 3. Direct startfile
+            try:
+                os.startfile(cmd)
+                return True, f"Opening {name}."
+            except Exception:
+                pass
+
+            return True, f"I couldn't find {name} installed on your system."
+
+    return False, ""
+
+
+# =============================================================================
+# FEATURE 3: SAFE FOLDER CONTROL
+# =============================================================================
+def get_user_directories() -> Dict[str, str]:
+    """Returns safe standard Windows user directories."""
+    user_home = os.path.expanduser("~")
+    return {
+        "downloads": os.path.join(user_home, "Downloads"),
+        "documents": os.path.join(user_home, "Documents"),
+        "pictures": os.path.join(user_home, "Pictures"),
+        "desktop": os.path.join(user_home, "Desktop"),
+        "music": os.path.join(user_home, "Music"),
+        "videos": os.path.join(user_home, "Videos"),
+    }
+
+
+def handle_open_folder(query: str) -> Tuple[bool, str]:
+    """Opens safe standard user folders in Windows File Explorer."""
+    folders = get_user_directories()
+    q = query.lower()
+
+    for name, path in folders.items():
+        pattern = rf"\bopen\s+(?:my\s+)?{name}(?:\s+folder)?\b"
+        if re.search(pattern, q):
+            if os.path.exists(path):
+                try:
+                    os.startfile(path)
+                    return True, f"Opening {name.title()}."
+                except Exception as e:
+                    return True, f"Could not open {name.title()}: {e}"
+            else:
+                return True, f"{name.title()} directory not found."
+
+    return False, ""
+
+
+# =============================================================================
+# FEATURE 4: VOLUME CONTROL
+# =============================================================================
+def handle_volume_control(query: str) -> Tuple[bool, str]:
+    """
+    Controls system volume (Increase, Decrease, Mute, Unmute, Set %).
+    Works via Windows virtual key events and pycaw if installed.
+    """
+    q = query.lower()
+
+    # 1. Mute / Unmute
+    if "mute" in q or "unmute" in q:
+        try:
+            # VK_VOLUME_MUTE = 0xAD
+            ctypes.windll.user32.keybd_event(0xAD, 0, 0, 0)
+            ctypes.windll.user32.keybd_event(0xAD, 0, 2, 0)
+            return True, "Volume muted or unmuted."
+        except Exception as e:
+            return True, f"Failed to toggle volume mute: {e}"
+
+    # 2. Increase volume
+    if any(p in q for p in ["increase volume", "volume up", "turn up volume", "raise volume"]):
+        try:
+            # Send 5 volume up key events (~10%)
+            for _ in range(5):
+                ctypes.windll.user32.keybd_event(0xAF, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xAF, 0, 2, 0)
+            return True, "Volume increased."
+        except Exception as e:
+            return True, f"Failed to increase volume: {e}"
+
+    # 3. Decrease volume
+    if any(p in q for p in ["decrease volume", "volume down", "lower volume", "turn down volume"]):
+        try:
+            # Send 5 volume down key events (~10%)
+            for _ in range(5):
+                ctypes.windll.user32.keybd_event(0xAE, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xAE, 0, 2, 0)
+            return True, "Volume decreased."
+        except Exception as e:
+            return True, f"Failed to decrease volume: {e}"
+
+    # 4. Set volume to X percent
+    set_match = re.search(r"set\s+volume\s+to\s+(\d+)(?:\s*percent|\s*%)?", q)
+    if set_match:
+        percent = int(set_match.group(1))
+        percent = max(0, min(100, percent))
+
+        if PYCAW_AVAILABLE:
+            try:
+                devices = AudioUtilities.GetSpeakers()
+                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                volume = ctypes.cast(interface, ctypes.POINTER(IAudioEndpointVolume))
+                volume.SetMasterVolumeLevelScalar(percent / 100.0, None)
+                return True, f"Volume set to {percent} percent."
+            except Exception as e:
+                pass
+
+        # Fallback using keybd_event approximation: zero out then increase
+        try:
+            for _ in range(50):
+                ctypes.windll.user32.keybd_event(0xAE, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xAE, 0, 2, 0)
+            steps = int(percent / 2)
+            for _ in range(steps):
+                ctypes.windll.user32.keybd_event(0xAF, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xAF, 0, 2, 0)
+            return True, f"Volume adjusted to approximately {percent} percent."
+        except Exception as e:
+            return True, f"Could not set volume: {e}"
+
+    return False, ""
+
+
+# =============================================================================
+# FEATURE 5: SAFE FILE SEARCH
+# =============================================================================
+def handle_file_search(query: str) -> Tuple[bool, str]:
+    """
+    Searches for files in safe user directories (Desktop, Documents, Downloads, Pictures).
+    Examples:
+    - 'Find my Python files'
+    - 'Find resume.pdf'
+    - 'Find files named project'
+    - 'Search my Downloads for CSV files'
+    """
+    q = query.lower()
+    search_triggers = ["find", "search for file", "search for files", "search my", "locate file"]
+    if not any(q.startswith(trig) or f" {trig} " in f" {q} " for trig in search_triggers):
+        return False, ""
+
+    # Determine target directories
+    user_dirs = get_user_directories()
+    search_roots = [user_dirs["desktop"], user_dirs["documents"], user_dirs["downloads"], user_dirs["pictures"]]
+
+    if "download" in q:
+        search_roots = [user_dirs["downloads"]]
+    elif "document" in q:
+        search_roots = [user_dirs["documents"]]
+    elif "desktop" in q:
+        search_roots = [user_dirs["desktop"]]
+    elif "picture" in q:
+        search_roots = [user_dirs["pictures"]]
+
+    # Extract target pattern
+    # 1. Extension match: "python files" -> *.py, "csv files" -> *.csv, "pdf files" -> *.pdf
+    ext_map = {
+        "python": "*.py",
+        "csv": "*.csv",
+        "pdf": "*.pdf",
+        "text": "*.txt",
+        "txt": "*.txt",
+        "json": "*.json",
+        "markdown": "*.md",
+        "word": "*.docx",
+        "excel": "*.xlsx",
+    }
+
+    target_pattern = None
+    for name, pattern in ext_map.items():
+        if f"{name} file" in q or f"{name} files" in q:
+            target_pattern = pattern
+            break
+
+    # 2. Specific filename: "find resume.pdf" or "find files named project"
+    if not target_pattern:
+        named_match = re.search(r"(?:find|search(?:\s+my\s+\w+)?\s+for)\s+(?:files?\s+named\s+|file\s+)?([a-zA-Z0-9_\-\.]+)", q)
+        if named_match:
+            candidate = named_match.group(1).strip()
+            if candidate and candidate not in ["files", "file", "my", "all"]:
+                if "." in candidate:
+                    target_pattern = f"*{candidate}*"
+                else:
+                    target_pattern = f"*{candidate}*"
+
+    if not target_pattern:
+        return False, ""
+
+    # Perform safe, bounded directory scan (max depth 3, max 500 files checked)
+    matched_files = []
+    scanned_count = 0
+    max_scan = 500
+
+    for root_dir in search_roots:
+        if not os.path.exists(root_dir):
+            continue
+        try:
+            for root, dirs, files in os.walk(root_dir):
+                # Skip hidden/system directories
+                dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() not in ["appdata", "node_modules", ".git", "venv", "__pycache__"]]
+                
+                # Check depth
+                rel_path = os.path.relpath(root, root_dir)
+                depth = len(rel_path.split(os.sep)) if rel_path != "." else 0
+                if depth > 3:
+                    dirs[:] = []
+                    continue
+
+                for f in files:
+                    scanned_count += 1
+                    if scanned_count > max_scan or len(matched_files) >= 5:
+                        break
+
+                    if target_pattern.startswith("*."):
+                        ext_suffix = target_pattern[1:].lower()  # e.g. .py
+                        if f.lower().endswith(ext_suffix):
+                            matched_files.append(os.path.join(root, f))
+                    else:
+                        clean_target = target_pattern.replace("*", "").lower()
+                        if clean_target in f.lower():
+                            matched_files.append(os.path.join(root, f))
+
+                if len(matched_files) >= 5 or scanned_count > max_scan:
+                    break
+        except Exception:
+            continue
+
+    if not matched_files:
+        return True, f"I couldn't find any matching files for {target_pattern} in your user folders."
+
+    count_str = f"I found {len(matched_files)} matching file{'s' if len(matched_files) > 1 else ''}:"
+    result_lines = [count_str]
+    for path in matched_files:
+        result_lines.append(f"• {path}")
+
+    return True, "\n".join(result_lines)
+
+
+# =============================================================================
+# FEATURE 6: READ TEXT FILES
+# =============================================================================
+SAFE_TEXT_EXTENSIONS = [".txt", ".csv", ".md", ".json", ".py", ".log", ".ini", ".env"]
+
+
+def handle_read_file(query: str) -> Tuple[bool, str]:
+    """
+    Safely reads and summarizes text-based files.
+    Example: 'Read my notes.txt' or 'Read file requirements.txt'
+    """
+    q = query.strip()
+    match = re.search(r"\bread\s+(?:my\s+|the\s+|file\s+)?([a-zA-Z0-9_\-\.\/\\]+)", q, re.IGNORECASE)
+    if not match:
+        return False, ""
+
+    filename = match.group(1).strip().rstrip(".,")
+    if filename.lower() in ["time", "date", "screen", "news"]:
+        return False, ""
+
+    # Candidates paths: current working directory, Desktop, Documents, Downloads
+    user_dirs = get_user_directories()
+    candidate_paths = [
+        os.path.abspath(filename),
+        os.path.join(os.getcwd(), filename),
+        os.path.join(user_dirs["desktop"], filename),
+        os.path.join(user_dirs["documents"], filename),
+        os.path.join(user_dirs["downloads"], filename),
+    ]
+
+    target_path = None
+    for p in candidate_paths:
+        if os.path.isfile(p):
+            target_path = p
+            break
+
+    if not target_path:
+        # Search by filename in current dir & user folders
+        for root_dir in [os.getcwd(), user_dirs["desktop"], user_dirs["documents"], user_dirs["downloads"]]:
+            found = glob.glob(os.path.join(root_dir, f"*{filename}*"))
+            if found and os.path.isfile(found[0]):
+                target_path = found[0]
+                break
+
+    if not target_path:
+        return True, f"I could not find the file '{filename}' in your project or user folders."
+
+    # Validate safe extension
+    _, ext = os.path.splitext(target_path)
+    if ext.lower() not in SAFE_TEXT_EXTENSIONS:
+        return True, f"For security reasons, I only read safe text-based files ({', '.join(SAFE_TEXT_EXTENSIONS)})."
+
+    try:
+        with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read(3000)  # Safe bounded read
+
+        if not content.strip():
+            return True, f"The file '{os.path.basename(target_path)}' is currently empty."
+
+        # If short, read directly; if longer, provide clear summary via Gemini or excerpt
+        if len(content) < 200:
+            return True, f"Here is the content of {os.path.basename(target_path)}:\n{content.strip()}"
+
+        # Summarize with Gemini if available
+        summary_prompt = (
+            f"Summarize the following contents of '{os.path.basename(target_path)}' in 2 concise, "
+            f"professional sentences suitable for speech synthesis:\n\n{content}"
+        )
+        ai_summary = ask_ai(summary_prompt)
+        if ai_summary and not ai_summary.startswith("I could not reach Gemini"):
+            return True, f"Summary of {os.path.basename(target_path)}: {ai_summary}"
+
+        # Fallback excerpt
+        excerpt = content[:250].strip().replace("\n", " ")
+        return True, f"Read {os.path.basename(target_path)}: {excerpt}..."
+
+    except Exception as e:
+        return True, f"Failed to read file: {e}"
+
+
+# =============================================================================
+# FEATURE 8: SCREEN VISION (GEMINI VISION)
+# =============================================================================
+def handle_screen_vision() -> str:
+    """
+    Captures a temporary screenshot and analyzes what is visible using Gemini Vision.
+    Security: The image is analyzed in-memory/temp file and not permanently stored.
+    """
+    if ImageGrab is None:
+        return "Pillow library is required for screen vision. Please run pip install Pillow."
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        return "GEMINI_API_KEY is not configured in your .env file. Screen vision requires a valid Gemini API key."
+
+    if genai is None:
+        return "The google-genai library is not installed. Please run pip install google-genai."
+
+    try:
+        # Capture screenshot
+        screenshot = ImageGrab.grab()
+        # Resize slightly for fast processing and optimal token usage
+        screenshot.thumbnail((1280, 720))
+
+        client = genai.Client(api_key=api_key)
+        vision_prompt = (
+            "Analyze the user's screen in 2 to 3 concise, natural, and polite sentences suitable for speech output. "
+            "Identify the active application, editor, document, or webpage visible."
+        )
+
+        vision_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        response = None
+        last_err = None
+
+        for model_name in vision_models:
+            try:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[vision_prompt, screenshot],
+                    config=types.GenerateContentConfig(
+                        system_instruction=AI_SYSTEM_INSTRUCTION,
+                        temperature=0.4,
+                        max_output_tokens=250,
+                    ),
+                )
+                if response and response.text:
+                    break
+            except Exception as err:
+                last_err = err
+                continue
+
+        if response and response.text:
+            cleaned = response.text.replace("**", "").replace("*", "").strip()
+            return cleaned
+        elif last_err:
+            return f"Screen vision analysis encountered an issue: {last_err}"
+
+        return "I took a look at your screen, but received an empty response."
+
+    except Exception as e:
+        return f"Failed to analyze screen: {e}"
+
+
+# =============================================================================
+# FEATURE 9: GEMINI AI BRAIN WITH ROLLING CONVERSATION MEMORY & USER MEMORY
 # =============================================================================
 class ChatBrain:
     """Maintains continuous 1-on-1 conversational memory with Google Gemini."""
@@ -197,7 +866,25 @@ class ChatBrain:
     def __init__(self):
         self.chat_session = None
         self.client = None
+        self.history: List[Dict[str, str]] = []  # Rolling 6-turn session history
         self._initialize_chat()
+
+    def _get_contextual_instruction(self) -> str:
+        """Injects stored user memories into the system prompt."""
+        mem = load_memory()
+        facts = mem.get("facts", {})
+        statements = mem.get("statements", [])
+
+        memory_context = ""
+        if facts or statements:
+            items = []
+            for k, v in facts.items():
+                items.append(f"{k}: {v}")
+            for st in statements[:5]:
+                items.append(st)
+            memory_context = f"\nUser Personal Context & Saved Memories:\n- " + "\n- ".join(items)
+
+        return AI_SYSTEM_INSTRUCTION + memory_context
 
     def _initialize_chat(self):
         api_key = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -206,11 +893,10 @@ class ChatBrain:
 
         try:
             self.client = genai.Client(api_key=api_key)
-            # Create a persistent chat session
             self.chat_session = self.client.chats.create(
-                model="gemini-3.5-flash-lite",
+                model="gemini-2.5-flash",
                 config=types.GenerateContentConfig(
-                    system_instruction=AI_SYSTEM_INSTRUCTION,
+                    system_instruction=self._get_contextual_instruction(),
                     temperature=0.7,
                     max_output_tokens=350,
                 ),
@@ -238,30 +924,40 @@ class ChatBrain:
                 response = self.chat_session.send_message(prompt)
                 if response and response.text:
                     cleaned_text = response.text.replace("**", "").replace("*", "").strip()
+                    self.history.append({"user": prompt, "assistant": cleaned_text})
+                    if len(self.history) > 6:
+                        self.history.pop(0)
                     return cleaned_text
             except Exception:
-                # If session timed out or had an error, reset and try fallback
                 self.chat_session = None
 
-        # 2. Fallback to direct generate_content with multiple models
+        # 2. Multi-model fallback
         try:
             client = genai.Client(api_key=api_key)
             models_to_try = [
+                "gemini-2.5-flash",
+                "gemini-2.0-flash",
+                "gemini-1.5-flash",
                 "gemini-3.5-flash-lite",
-                "gemini-3.5-flash",
-                "gemini-3-flash-preview",
-                "gemini-3.7-flash",
             ]
             response = None
             last_err = None
+
+            # Build rolling context for fallback
+            context_prompt = ""
+            if self.history:
+                recent = self.history[-3:]
+                context_prompt = "Recent conversation context:\n" + "\n".join([f"User: {h['user']}\nJARVIS: {h['assistant']}" for h in recent]) + f"\n\nCurrent Query: {prompt}"
+            else:
+                context_prompt = prompt
 
             for model_name in models_to_try:
                 try:
                     response = client.models.generate_content(
                         model=model_name,
-                        contents=prompt,
+                        contents=context_prompt,
                         config=types.GenerateContentConfig(
-                            system_instruction=AI_SYSTEM_INSTRUCTION,
+                            system_instruction=self._get_contextual_instruction(),
                             temperature=0.7,
                             max_output_tokens=300,
                         ),
@@ -274,6 +970,9 @@ class ChatBrain:
 
             if response and response.text:
                 cleaned_text = response.text.replace("**", "").replace("*", "").strip()
+                self.history.append({"user": prompt, "assistant": cleaned_text})
+                if len(self.history) > 6:
+                    self.history.pop(0)
                 return cleaned_text
             elif last_err:
                 raise last_err
@@ -285,7 +984,6 @@ class ChatBrain:
             return f"I encountered an error connecting to Gemini AI: {error_msg}"
 
 
-# Global AI brain instance
 ai_brain = ChatBrain()
 
 
@@ -295,7 +993,7 @@ def ask_ai(prompt: str) -> str:
 
 
 # =============================================================================
-# SAFE CALCULATOR (NO UNRESTRICTED EVAL)
+# SAFE MATHEMATICAL CALCULATOR (NO UNRESTRICTED EVAL)
 # =============================================================================
 SAFE_OPERATORS = {
     ast.Add: operator.add,
@@ -338,16 +1036,13 @@ def _safe_eval_ast(node):
 def safe_calculate(expression_str: str) -> Optional[float]:
     """Safely calculates mathematical expressions without using eval()."""
     try:
-        # Preprocess percentage phrases: "25 percent of 800" -> "(25 / 100) * 800"
         cleaned = re.sub(
             r"(\d+(?:\.\d+)?)\s*(?:percent|%)\s*(?:of)\s*(\d+(?:\.\d+)?)",
             r"((\1 / 100) * \2)",
             expression_str,
             flags=re.IGNORECASE,
         )
-        # Clean common symbols
         cleaned = cleaned.replace("x", "*").replace("X", "*").replace("^", "**")
-        # Remove any non-math characters
         sanitized = re.sub(r"[^0-9\+\-\*\/\%\(\)\.\s]", "", cleaned).strip()
         if not sanitized:
             return None
@@ -360,7 +1055,7 @@ def safe_calculate(expression_str: str) -> Optional[float]:
 
 
 # =============================================================================
-# LOCAL COMMAND HANDLERS
+# LOCAL SYSTEM & WEB COMMAND HANDLERS
 # =============================================================================
 def get_greeting() -> str:
     """Returns an appropriate greeting based on current local time."""
@@ -371,7 +1066,7 @@ def get_greeting() -> str:
         time_greeting = "Good afternoon"
     else:
         time_greeting = "Good evening"
-    return f"{time_greeting}. JARVIS is online. How may I assist you?"
+    return f"{time_greeting}. JARVIS V2 is online. How may I assist you?"
 
 
 def handle_time() -> str:
@@ -418,6 +1113,57 @@ def handle_system_info(info_type: str) -> str:
     return "System info not available."
 
 
+# =============================================================================
+# FEATURE 14 & 15: HELP & STATUS COMMANDS
+# =============================================================================
+def handle_help() -> str:
+    """Returns a clean overview of JARVIS capabilities."""
+    return (
+        "JARVIS can currently:\n"
+        "• Answer questions & converse using Gemini AI\n"
+        "• Open applications (Chrome, VS Code, Spotify, etc.)\n"
+        "• Open user folders (Downloads, Documents, Desktop, Pictures)\n"
+        "• Search the web & open websites\n"
+        "• Control system volume (Up, Down, Mute, Set %)\n"
+        "• Check CPU and RAM performance\n"
+        "• Search files in user folders\n"
+        "• Read and summarize text files (.txt, .md, .py, .csv, .json)\n"
+        "• Take screenshots & analyze your screen visually\n"
+        "• Remember personal details & retrieve stored memories\n"
+        "• Perform safe mathematical calculations"
+    )
+
+
+def handle_system_status() -> str:
+    """Returns current comprehensive system & assistant status."""
+    ai_status = "Connected" if os.environ.get("GEMINI_API_KEY") else "Offline (No API Key)"
+    mic_status = "Ready" if sr is not None else "Keyboard Mode"
+    speaker_status = "Ready (Windows SAPI)" if sapi_voice is not None else ("Ready (pyttsx3)" if tts_engine else "Text-only")
+    
+    mem = load_memory()
+    mem_count = len(mem.get("facts", {})) + len(mem.get("statements", []))
+    memory_status = f"Ready ({mem_count} items stored)"
+
+    cpu_str = f"{psutil.cpu_percent(interval=0.2)}%" if psutil else "N/A"
+    ram_str = f"{psutil.virtual_memory().percent}%" if psutil else "N/A"
+    time_str = datetime.datetime.now().strftime("%I:%M %p")
+
+    status_report = (
+        "JARVIS STATUS\n"
+        f"AI: {ai_status}\n"
+        f"Microphone: {mic_status}\n"
+        f"Speaker: {speaker_status}\n"
+        f"Memory: {memory_status}\n"
+        f"CPU: {cpu_str}\n"
+        f"RAM: {ram_str}\n"
+        f"Current time: {time_str}"
+    )
+    return status_report
+
+
+# =============================================================================
+# WEB & SCREENSHOT HANDLERS
+# =============================================================================
 def handle_open_website(query: str) -> Tuple[bool, str]:
     """Opens popular websites or custom URLs safely in the default browser."""
     sites = {
@@ -439,7 +1185,6 @@ def handle_open_website(query: str) -> Tuple[bool, str]:
             except Exception as e:
                 return True, f"Could not open {name}: {e}"
 
-    # Generic website matching like 'open example.com'
     match = re.search(r"open\s+([a-zA-Z0-9\-]+\.[a-zA-Z]{2,})", query)
     if match:
         domain = match.group(1)
@@ -449,72 +1194,6 @@ def handle_open_website(query: str) -> Tuple[bool, str]:
             return True, f"Opening {domain}."
         except Exception as e:
             return True, f"Could not open {domain}: {e}"
-
-    return False, ""
-
-
-def handle_open_app(query: str) -> Tuple[bool, str]:
-    """Safely launches common Windows applications."""
-    apps = {
-        "notepad": {"cmd": "notepad.exe", "name": "Notepad"},
-        "calculator": {"cmd": "calc.exe", "name": "Calculator"},
-        "calc": {"cmd": "calc.exe", "name": "Calculator"},
-        "file explorer": {"cmd": "explorer.exe", "name": "File Explorer"},
-        "explorer": {"cmd": "explorer.exe", "name": "File Explorer"},
-        "vs code": {"cmd": "code", "name": "Visual Studio Code"},
-        "vscode": {"cmd": "code", "name": "Visual Studio Code"},
-        "chrome": {"cmd": "chrome", "name": "Google Chrome"},
-        "google chrome": {"cmd": "chrome", "name": "Google Chrome"},
-        "edge": {"cmd": "msedge", "name": "Microsoft Edge"},
-        "microsoft edge": {"cmd": "msedge", "name": "Microsoft Edge"},
-    }
-
-    # Known absolute fallback paths for Windows browsers
-    known_paths = {
-        "chrome": [
-            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
-            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
-            os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
-        ],
-        "msedge": [
-            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
-            os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
-        ],
-    }
-
-    for key, app_data in apps.items():
-        # Match 'open [app]' or just the app name if explicitly asked
-        pattern = rf"\b(open|launch|start)?\s*{re.escape(key)}\b"
-        if re.search(pattern, query):
-            cmd = app_data["cmd"]
-            name = app_data["name"]
-
-            # Try locating in PATH
-            if shutil.which(cmd):
-                try:
-                    subprocess.Popen([cmd], shell=True)
-                    return True, f"Opening {name}."
-                except Exception as e:
-                    return True, f"Failed to launch {name}: {e}"
-
-            # Try direct Windows paths if browser
-            if cmd in known_paths:
-                for path in known_paths[cmd]:
-                    if os.path.exists(path):
-                        try:
-                            os.startfile(path)
-                            return True, f"Opening {name}."
-                        except Exception as e:
-                            return True, f"Failed to start {name}: {e}"
-
-            # Try os.startfile directly
-            try:
-                os.startfile(cmd)
-                return True, f"Opening {name}."
-            except Exception:
-                pass
-
-            return True, f"I could not find {name} installed on your system."
 
     return False, ""
 
@@ -529,16 +1208,15 @@ def handle_search_web(query: str) -> Tuple[bool, str]:
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, query)
+        match = re.search(pattern, query, re.IGNORECASE)
         if match:
             search_term = match.group(1).strip()
-            # Clean trailing punctuation
             search_term = re.sub(r"[\s,\.\!\?]+$", "", search_term)
             if search_term:
                 url = f"https://www.google.com/search?q={search_term.replace(' ', '+')}"
                 try:
                     webbrowser.open(url)
-                    return True, f"Searching the web for {search_term}."
+                    return True, f"Searching the web for {search_term} in your browser."
                 except Exception as e:
                     return True, f"Failed to open browser search: {e}"
 
@@ -553,15 +1231,12 @@ def handle_screenshot() -> str:
     try:
         pictures_dir = os.path.join(os.path.expanduser("~"), "Pictures")
         screenshots_dir = os.path.join(pictures_dir, "Screenshots")
-
-        # Create directory if it doesn't exist
         os.makedirs(screenshots_dir, exist_ok=True)
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"screenshot_{timestamp}.png"
         filepath = os.path.join(screenshots_dir, filename)
 
-        # Capture and save
         screenshot = ImageGrab.grab()
         screenshot.save(filepath)
 
@@ -571,17 +1246,15 @@ def handle_screenshot() -> str:
 
 
 # =============================================================================
-# COMMAND ROUTER
+# FEATURE 11: COMMAND PRIORITY ROUTER
 # =============================================================================
 def strip_wake_word(text: str) -> str:
-    """Cleans and removes wake words ('Jarvis', 'Hey Jarvis') from start, end, or inside sentences."""
+    """Cleans and removes wake words ('Jarvis', 'Hey Jarvis') from text."""
     if not text:
         return ""
     
     cleaned = text.strip()
-    # Normalize wake words with regex regardless of position (start or end)
     cleaned = re.sub(r"\b(hey\s+|ok\s+|okay\s+)?jarvis\b", "", cleaned, flags=re.IGNORECASE)
-    # Strip residual punctuation and spaces
     cleaned = re.sub(r"^[\s,\.\!\?]+", "", cleaned)
     cleaned = re.sub(r"[\s,\.\!\?]+$", "", cleaned).strip()
     return cleaned
@@ -589,100 +1262,158 @@ def strip_wake_word(text: str) -> str:
 
 def route_command(raw_input: str) -> Tuple[str, bool]:
     """
-    Main routing pipeline:
-    1. Normalizes text
-    2. Checks for wake word
-    3. Checks local commands (time, date, apps, web, math, sys info, exit)
-    4. Routes to Gemini AI for general knowledge & conversation
+    Main V2 command priority routing pipeline:
+    1. Normalize text
+    2. Check pending confirmation state
+    3. Check wake word
+    4. Check exit commands
+    5. Check help & system status commands
+    6. Check screen vision
+    7. Check volume control
+    8. Check local commands (time, date, CPU, RAM, OS, screenshot)
+    9. Check memory commands (remember, recall, forget, clear)
+    10. Check file search & read text files
+    11. Check folder control (Downloads, Documents, etc.)
+    12. Check web search & website opening
+    13. Check application control (Chrome, VS Code, Spotify, etc.)
+    14. Check safe mathematical calculator
+    15. Route to Gemini AI Brain with rolling session history and personal memory context
     Returns (response_text, should_exit)
     """
+    global PENDING_CONFIRMATION
+
     if not raw_input or not raw_input.strip():
         return "", False
+
+    # 1. Pending Confirmation State
+    conf_result = check_confirmation(raw_input)
+    if conf_result is not None:
+        return conf_result
 
     prompt = strip_wake_word(raw_input)
     prompt_lower = prompt.lower().strip()
 
-    # If the user only said "Jarvis" or "Hey Jarvis"
+    # Empty prompt after wake word
     if not prompt_lower:
-        return "Yes, I am listening. How can I help you?", False
+        return "Yes, I am listening. How can I assist you?", False
 
-    # 1. Exit Commands
+    # 2. Exit Commands
     exit_triggers = ["goodbye", "exit", "quit", "shutdown", "bye", "go offline", "terminate"]
     if any(prompt_lower == trig or prompt_lower.startswith(trig) for trig in exit_triggers):
         return "Goodbye. JARVIS going offline.", True
 
-    # 2. Conversational Quick Matches
+    # 3. Conversational Greetings
     if prompt_lower in ["hello", "hi", "hey", "good morning", "good afternoon", "good evening"]:
         return "Hello. How can I help you?", False
 
     if "who created you" in prompt_lower or "who made you" in prompt_lower:
-        return "I am your personal AI assistant, created by you.", False
+        return "I am J.A.R.V.I.S V2, your personal AI desktop assistant, created by you.", False
 
-    if "what can you do" in prompt_lower or prompt_lower == "help":
-        return (
-            "I can tell you the time and date, open applications like Chrome, VS Code, "
-            "and Calculator, open websites like YouTube and GitHub, search the web, "
-            "perform safe calculations, monitor your CPU and RAM usage, take screenshots, "
-            "and answer general questions using Gemini AI.",
-            False,
-        )
+    # 4. Help & Status Commands
+    if prompt_lower in ["help", "what can you do", "show commands", "commands"]:
+        return handle_help(), False
 
-    # 3. Time and Date
-    if "time" in prompt_lower and ("what" in prompt_lower or "tell" in prompt_lower or "current" in prompt_lower):
+    if any(p in prompt_lower for p in ["system status", "status report", "jarvis status"]):
+        return handle_system_status(), False
+
+    # 5. Screen Vision
+    if any(p in prompt_lower for p in ["look at my screen", "what is on my screen", "analyze my screen", "describe my screen"]):
+        return handle_screen_vision(), False
+
+    # 6. Volume Control
+    handled_vol, vol_resp = handle_volume_control(prompt_lower)
+    if handled_vol:
+        return vol_resp, False
+
+    # 7. Time and Date
+    if "time" in prompt_lower and any(w in prompt_lower for w in ["what", "tell", "current"]):
         return handle_time(), False
 
-    if ("date" in prompt_lower or "today" in prompt_lower) and ("what" in prompt_lower or "tell" in prompt_lower or "current" in prompt_lower):
+    if ("date" in prompt_lower or "today" in prompt_lower) and any(w in prompt_lower for w in ["what", "tell", "current"]):
         return handle_date(), False
 
-    # 4. System Info (CPU, RAM, OS)
+    # 8. System Diagnostics (CPU, RAM, OS)
     if "cpu" in prompt_lower:
         return handle_system_info("cpu"), False
 
-    if "ram" in prompt_lower or "memory" in prompt_lower:
+    if "ram" in prompt_lower and not ("program" in prompt_lower or "frame" in prompt_lower):
         return handle_system_info("ram"), False
 
-    if "operating system" in prompt_lower or "what os" in prompt_lower or "system info" in prompt_lower:
+    if any(p in prompt_lower for p in ["operating system", "what os", "which os"]):
         return handle_system_info("os"), False
 
-    # 5. Screenshot
+    # 9. Screenshot
     if "screenshot" in prompt_lower or "screen capture" in prompt_lower:
         return handle_screenshot(), False
 
-    # 6. Web Searches
-    handled_search, search_resp = handle_search_web(prompt_lower)
+    # 10. Memory Commands
+    # Clear memory (requires confirmation)
+    if re.search(r"\b(clear|reset|erase|wipe)\s+(?:all\s+)?(?:of\s+)?(?:my\s+)?(?:stored\s+)?(memor(?:y|ies))\b", prompt_lower) or "forget everything" in prompt_lower:
+        PENDING_CONFIRMATION = {"action": "clear_memory"}
+        return "This will permanently remove all stored memories. Are you sure?", False
+
+    # Forget fact
+    if prompt_lower.startswith("forget that") or prompt_lower.startswith("forget "):
+        return handle_forget(prompt), False
+
+    # Remember fact
+    if prompt_lower.startswith("remember that") or prompt_lower.startswith("remember "):
+        return handle_remember(prompt), False
+
+    # Memory retrieval query
+    mem_resp = handle_memory_query(prompt)
+    if mem_resp:
+        return mem_resp, False
+
+    # 11. Read Text Files
+    handled_read, read_resp = handle_read_file(prompt)
+    if handled_read:
+        return read_resp, False
+
+    # 12. File Search
+    handled_file_search, search_file_resp = handle_file_search(prompt)
+    if handled_file_search:
+        return search_file_resp, False
+
+    # 13. Folder Control
+    if "open" in prompt_lower or "launch" in prompt_lower:
+        handled_folder, folder_resp = handle_open_folder(prompt_lower)
+        if handled_folder:
+            return folder_resp, False
+
+    # 14. Web Search
+    handled_search, search_resp = handle_search_web(prompt)
     if handled_search:
         return search_resp, False
 
-    # 7. Open Websites
+    # 15. Open Websites
     if "open" in prompt_lower or "launch" in prompt_lower:
         handled_web, web_resp = handle_open_website(prompt_lower)
         if handled_web:
             return web_resp, False
 
-        # 8. Open Applications
+        # 16. Open Applications
         handled_app, app_resp = handle_open_app(prompt_lower)
         if handled_app:
             return app_resp, False
 
-    # 9. Calculator
+    # 17. Safe Calculator
     if "calculate" in prompt_lower or "percent of" in prompt_lower or re.search(r"what is \d+", prompt_lower):
-        # Extract math expression
         math_candidate = re.sub(r"^(calculate|what is|how much is)\s*", "", prompt_lower, flags=re.IGNORECASE)
         math_candidate = math_candidate.rstrip("?.").strip()
         result = safe_calculate(math_candidate)
         if result is not None:
-            # Format integer nicely if whole number
             if isinstance(result, float) and result.is_integer():
                 result = int(result)
             return f"The result is {result}.", False
 
-    # 10. Fallback to Gemini AI Brain
+    # 18. Fallback to Gemini AI Brain
     ai_response = ask_ai(prompt)
     return ai_response, False
 
 
 # =============================================================================
-# VOICE & INPUT HANDLING
+# VOICE & AUDIO INPUT PIPELINE
 # =============================================================================
 def record_with_sounddevice(
     fs: int = 16000,
@@ -693,19 +1424,17 @@ def record_with_sounddevice(
     """
     Captures voice from Windows default microphone using sounddevice.
     Maintains a rolling pre-speech ring buffer so initial words are never clipped.
-    Uses dynamic RMS energy threshold for speech start/stop detection.
     """
     if sd is None or np is None or sr is None:
         return None
 
     block_size = 1024
-    pre_buffer_size = 6  # ~380ms of pre-speech audio
+    pre_buffer_size = 6
     pre_buffer = collections.deque(maxlen=pre_buffer_size)
     frames = []
 
     try:
         with sd.InputStream(samplerate=fs, channels=1, dtype="int16") as stream:
-            # 1. Calibrate ambient background noise for 0.3s
             ambient_energies = []
             for _ in range(max(1, int(fs / block_size * 0.3))):
                 data, _ = stream.read(block_size)
@@ -715,9 +1444,8 @@ def record_with_sounddevice(
             avg_ambient = float(np.mean(ambient_energies)) if ambient_energies else 30.0
             speech_threshold = max(avg_ambient * 1.4, 180.0)
 
-            print("\nLISTENING... (Speak now or press Ctrl+C to exit)")
+            print("\nLISTENING... (Speak now or type command)")
 
-            # 2. Wait for speech start
             speech_started = False
             start_time = time.time()
             silence_start = None
@@ -731,11 +1459,9 @@ def record_with_sounddevice(
                     pre_buffer.append(data.copy())
                     if rms > speech_threshold:
                         speech_started = True
-                        # Include pre-speech buffer so first syllables are preserved
                         frames.extend(list(pre_buffer))
                         silence_start = None
                     elif elapsed > listen_timeout:
-                        # Timeout waiting for speech
                         return None
                 else:
                     frames.append(data.copy())
@@ -743,12 +1469,10 @@ def record_with_sounddevice(
                         if silence_start is None:
                             silence_start = time.time()
                         elif time.time() - silence_start >= silence_limit:
-                            # User stopped speaking
                             break
                     else:
                         silence_start = None
 
-                    # Guard against exceeding max duration
                     if len(frames) * block_size / fs >= max_seconds:
                         break
 
@@ -764,9 +1488,7 @@ def record_with_sounddevice(
 
 def listen(recognizer: Optional[object] = None, mic_backend: Optional[str] = None) -> str:
     """
-    Captures voice input from the microphone.
-    Supports sounddevice (no C++ build tools required) and PyAudio backends.
-    Gracefully falls back to console text input if no microphone is available.
+    Captures voice input from the microphone or falls back cleanly to console text.
     """
     if recognizer is None or sr is None or mic_backend is None:
         try:
@@ -775,7 +1497,6 @@ def listen(recognizer: Optional[object] = None, mic_backend: Optional[str] = Non
         except (EOFError, KeyboardInterrupt):
             return "exit"
 
-    # 1. Primary backend: sounddevice (Realtek / Windows Audio)
     if mic_backend == "sounddevice":
         try:
             audio = record_with_sounddevice()
@@ -798,7 +1519,6 @@ def listen(recognizer: Optional[object] = None, mic_backend: Optional[str] = Non
             except (EOFError, KeyboardInterrupt):
                 return "exit"
 
-    # 2. Secondary backend: PyAudio / sr.Microphone
     elif mic_backend == "pyaudio":
         try:
             with sr.Microphone() as source:
@@ -831,18 +1551,23 @@ def listen(recognizer: Optional[object] = None, mic_backend: Optional[str] = Non
 
 
 # =============================================================================
-# MAIN APPLICATION
+# FEATURE 13: STARTUP EXPERIENCE & BANNER
 # =============================================================================
-def print_banner():
-    """Displays the startup banner in the terminal."""
-    banner = """
+def print_banner(ai_connected: bool, mic_ready: bool):
+    """Displays the startup banner in the terminal matching V2 specifications."""
+    ai_status = "CONNECTED" if ai_connected else "OFFLINE (Check .env)"
+    voice_status = "READY" if mic_ready else "KEYBOARD MODE"
+
+    banner = f"""
 ========================================
-             J.A.R.V.I.S
-    Personal AI Voice Assistant
+             J.A.R.V.I.S V2
+         PERSONAL AI ASSISTANT
 ========================================
 STATUS: ONLINE
-ENVIRONMENT: Windows
-AI BRAIN: Google Gemini
+AI: {ai_status}
+VOICE: {voice_status}
+MEMORY: READY
+SYSTEM: READY
 ========================================
 """
     print(banner)
@@ -850,7 +1575,6 @@ AI BRAIN: Google Gemini
 
 def detect_microphone_backend() -> Tuple[Optional[str], Optional[str]]:
     """Detects available microphone hardware and driver backend."""
-    # Check sounddevice
     if sd is not None and np is not None:
         try:
             input_device = sd.default.device[0]
@@ -861,7 +1585,6 @@ def detect_microphone_backend() -> Tuple[Optional[str], Optional[str]]:
         except Exception:
             pass
 
-    # Check PyAudio / sr.Microphone
     if sr is not None:
         try:
             with sr.Microphone():
@@ -873,38 +1596,30 @@ def detect_microphone_backend() -> Tuple[Optional[str], Optional[str]]:
 
 
 def main():
-    """Main execution loop for JARVIS."""
-    print_banner()
-
-    # Check microphone availability
+    """Main execution loop for JARVIS V2."""
     recognizer = sr.Recognizer() if sr is not None else None
     mic_backend, mic_device_name = detect_microphone_backend()
+    ai_connected = bool(os.environ.get("GEMINI_API_KEY"))
+
+    print_banner(ai_connected=ai_connected, mic_ready=bool(mic_backend))
 
     if mic_backend:
         print(f"[Microphone: Ready ({mic_device_name})]")
     else:
         print("[Microphone: Not detected. Interactive keyboard input mode enabled]")
 
-    # Check Gemini API Key
-    if os.environ.get("GEMINI_API_KEY"):
-        print("[Gemini AI: Connected]")
-    else:
-        print("[Gemini AI: No GEMINI_API_KEY found. Check .env file]")
-
-    # 1. Startup Greeting
+    # Startup Greeting
     startup_greeting = get_greeting()
     speak(startup_greeting)
 
     # Main interaction loop
     while True:
         try:
-            # Capture voice / input
             raw_input = listen(recognizer, mic_backend)
 
             if not raw_input or not raw_input.strip():
                 continue
 
-            # Route and execute command
             response, should_exit = route_command(raw_input)
 
             if response:

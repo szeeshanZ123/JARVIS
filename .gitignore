@@ -21,3 +21,4 @@ ENV/
 # Logs and databases
 *.log
 *.sqlite3
+jarvis_memory.json

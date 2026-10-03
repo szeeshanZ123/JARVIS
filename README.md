@@ -1,24 +1,25 @@
-# 🤖 J.A.R.V.I.S — Personal AI Desktop Voice Assistant
+# 🤖 J.A.R.V.I.S V2 — Personal AI Desktop Assistant
 
 [![Python Version](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](https://www.microsoft.com/windows)
 
-An intelligent, lightweight, and responsive personal desktop AI voice assistant powered by **Google Gemini AI** with real-time speech recognition, text-to-speech synthesis, system monitoring, and automated desktop actions.
+An intelligent, lightweight, and reliable personal desktop AI assistant for Windows powered by **Google Gemini AI** with persistent personal memory, safe application & folder launching, volume controls, file searching, reading and summarizing text files, screen vision analysis, system health monitoring, and natural voice interaction.
 
 ---
 
-## ✨ Features
+## ✨ What's New in V2
 
-- 🧠 **Gemini AI Brain**: Continuous 1-on-1 conversational memory with automated multi-model fallback (`gemini-3.5-flash`, `gemini-3.7-flash`, etc.).
-- 🎙️ **Dual Interaction Modes**: Seamless voice recognition via microphone and interactive keyboard console fallback.
-- 🗣️ **Ultra-Smooth Speech Output (TTS)**: High-performance native Windows SAPI voice engine with `pyttsx3` fallback.
-- 🖥️ **System Health Monitoring**: Real-time CPU load, RAM memory statistics, and OS hardware information.
-- 🚀 **App Launcher & Window Controller**: Launch Notepad, VS Code, Google Chrome, Microsoft Edge, Calculator, File Explorer, and more.
-- 🌐 **Web & Search Automation**: Quick search and direct navigation across Google, YouTube, GitHub, Stack Overflow, and custom URLs.
-- 📸 **Screenshot Capture**: Instantly capture and save full-screen screenshots directly to your `Pictures/Screenshots` directory.
-- 🔢 **Safe Math Engine**: AST-based secure mathematical evaluator for calculations and percentage problems without dangerous `eval()` execution.
-- 🧪 **Comprehensive Test Suite**: Automated unit and integration testing via `test_jarvis.py`.
+- 🧠 **Personal Persistent Memory (`jarvis_memory.json`)**: Remember facts ("Remember that my name is Zeeshan", "What project am I working on?", "What do you remember about me?").
+- 🔒 **Confirmation Mechanism**: Asks for confirmation before executing destructive operations like memory wipes.
+- 👁️ **Screen Vision**: Analyzes your screen with Gemini Vision ("Jarvis, look at my screen").
+- 📂 **Folder Control**: Seamlessly opens standard Windows folders (Downloads, Documents, Desktop, Pictures).
+- 🔊 **System Volume Control**: Windows master audio adjustment (Increase, Decrease, Mute, Set %).
+- 🔎 **Safe File Search**: Search user directories for specific files or formats ("Find my Python files", "Find resume.pdf").
+- 📖 **Read & Summarize Text Files**: Reads and summarizes `.txt`, `.md`, `.py`, `.csv`, `.json` files safely without code execution.
+- 💬 **Rolling Session Context**: Retains conversational context across multi-turn queries.
+- ⚡ **Structured Command Priority Router**: Executes local actions instantly without unnecessary API calls.
+- 📊 **Status & Help Systems**: Instant access to system health (`System status`) and full capability lists (`What can you do?`).
 
 ---
 
@@ -40,7 +41,7 @@ pip install -r requirements.txt
 > ```bash
 > pip install PyAudio
 > ```
-> *If PyAudio is not installed, JARVIS automatically provides smooth interactive console text input while maintaining full voice output (TTS).*
+> *If PyAudio is not installed, JARVIS automatically falls back to interactive console text input while maintaining full voice output (TTS).*
 
 ---
 
@@ -58,7 +59,7 @@ pip install -r requirements.txt
 
 ---
 
-## 🚀 Running JARVIS
+## 🚀 Running JARVIS V2
 
 Start the assistant:
 ```bash
@@ -69,12 +70,15 @@ python jarvis.py
 
 | Category | Example Voice / Text Queries |
 | :--- | :--- |
-| **Conversational AI** | *"Explain quantum computing in simple terms"*<br>*"Give me 3 tips to boost productivity"* |
-| **System Diagnostics**| *"What is my CPU usage?"*<br>*"Check RAM usage"*<br>*"What OS am I running?"* |
-| **App Launching** | *"Open VS Code"*<br>*"Launch Notepad"*<br>*"Open Chrome"*<br>*"Start Calculator"* |
-| **Web Search** | *"Search google for latest space missions"*<br>*"Open YouTube"*<br>*"Open github.com"* |
+| **Personal Memory** | *"Remember that my name is Zeeshan"*<br>*"What is my name?"*<br>*"What do you remember about me?"*<br>*"Forget that my favorite language is Python"*<br>*"Clear my memory"* *(Prompts for confirmation)* |
+| **Screen Vision** | *"Jarvis, look at my screen"*<br>*"What is on my screen?"* |
+| **App & Folder Control** | *"Open Chrome"*, *"Open VS Code"*, *"Open Spotify"*<br>*"Open Downloads"*, *"Open Documents"*, *"Open Desktop"* |
+| **File Operations** | *"Find my Python files"*<br>*"Find resume.pdf"*<br>*"Read requirements.txt"* |
+| **Volume Control** | *"Increase volume"*, *"Decrease volume"*, *"Mute volume"*, *"Set volume to 50%"* |
+| **Conversational AI** | *"Explain quantum computing in simple terms"*<br>*"Who created Python?"* |
+| **System Diagnostics**| *"System status"*<br>*"What is my CPU usage?"*<br>*"Check RAM usage"* |
+| **Web Search** | *"Search google for latest space missions"*<br>*"Open YouTube"* |
 | **Calculations** | *"Calculate 15 percent of 4500"*<br>*"What is (250 * 4) + 120?"* |
-| **Utilities** | *"Take a screenshot"*<br>*"What time is it?"*<br>*"What is today's date?"* |
 | **Exit** | *"Exit"*, *"Quit"*, *"Goodbye"*, *"Shutdown"* |
 
 ---
@@ -83,26 +87,16 @@ python jarvis.py
 
 Execute the automated test suite:
 ```bash
-python -m unittest test_jarvis.py
+python test_jarvis.py
 ```
 
 ---
 
 ## 🛡️ Security & Privacy
 
-- Secret keys stored inside `.env` are automatically ignored by `.gitignore` to prevent leaking credentials.
-- Math expressions are parsed and evaluated securely using Python's Abstract Syntax Tree (AST) rather than unsafe `eval()` executions.
-
----
-
-## 🤝 Contributing
-
-Contributions, issues, and feature requests are welcome!
-1. Fork the Project
-2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your Changes (`git commit -m 'feat: add some AmazingFeature'`)
-4. Push to the Branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
+- **Memory & Keys Protected**: `.env` and `jarvis_memory.json` are automatically ignored by `.gitignore`.
+- **Safe Sandboxing**: No arbitrary code execution from AI responses or inspected files.
+- **Confirmation Guards**: Destructive operations require explicit user confirmation.
 
 ---
 
