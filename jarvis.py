@@ -39,7 +39,6 @@ def load_env_file(env_filename: str = ".env") -> None:
     Automatically loads environment variables from a .env file.
     Supports python-dotenv if installed, with a built-in zero-dependency fallback.
     """
-    # 1. Try python-dotenv if present
     try:
         import dotenv
         dotenv.load_dotenv(env_filename)
@@ -47,7 +46,6 @@ def load_env_file(env_filename: str = ".env") -> None:
     except ImportError:
         pass
 
-    # 2. Built-in zero-dependency .env parser fallback
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(os.getcwd(), env_filename),
@@ -112,13 +110,17 @@ except ImportError:
     genai = None
     types = None
 
-# Optional Windows COM interface for robust SAPI TTS
+# Windows COM Interface for native SAPI TTS
 try:
+    import pythoncom
     import win32com.client
+    WIN32COM_AVAILABLE = True
 except ImportError:
+    pythoncom = None
     win32com = None
+    WIN32COM_AVAILABLE = False
 
-# Optional pycaw for advanced volume control
+# Optional pycaw for volume control
 try:
     from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
     from comtypes import CLSCTX_ALL
@@ -141,50 +143,67 @@ AI_SYSTEM_INSTRUCTION = (
     "unless you were informed they were completed."
 )
 
-# Initialize Windows SAPI Voice Engine safely
-sapi_voice = None
-if win32com is not None:
-    try:
-        sapi_voice = win32com.client.Dispatch("SAPI.SpVoice")
-        sapi_voice.Rate = 1  # Natural conversational tempo
-        sapi_voice.Volume = 100
-    except Exception:
-        sapi_voice = None
 
-# Fallback pyttsx3 engine
-tts_engine = None
+# =============================================================================
+# MULTI-LAYER TEXT-TO-SPEECH (TTS) ENGINE
+# =============================================================================
 tts_lock = threading.Lock()
-
-if sapi_voice is None and pyttsx3 is not None:
-    try:
-        tts_engine = pyttsx3.init()
-        tts_engine.setProperty("rate", 180)
-        tts_engine.setProperty("volume", 0.95)
-    except Exception:
-        tts_engine = None
 
 
 def speak(text: str) -> None:
-    """Prints and speaks the provided text reliably using Windows SAPI / TTS."""
+    """
+    Prints and speaks text reliably using Windows SAPI / pyttsx3 / PowerShell fallback.
+    Cleans markdown formatting and symbols so speech sounds natural.
+    """
     if not text:
         return
 
     print(f"\nJARVIS: {text}\n")
 
-    # 1. Primary: Native Windows SAPI (synchronous, never locks up)
-    if sapi_voice is not None:
-        try:
-            sapi_voice.Speak(text)
-            return
-        except Exception:
-            pass
+    # Clean text for natural speech synthesis
+    speech_text = re.sub(r"https?://\S+", "link", text)
+    speech_text = re.sub(r"[*_`#~|•\t]", " ", speech_text)
+    speech_text = re.sub(r"\s+", " ", speech_text).strip()
 
-    # 2. Secondary: pyttsx3 fallback
-    if tts_engine is not None:
+    if not speech_text:
+        return
+
+    with tts_lock:
+        # Layer 1: Windows SAPI via win32com (Native, instant, zero latency)
+        if WIN32COM_AVAILABLE and win32com is not None:
+            try:
+                if pythoncom is not None:
+                    pythoncom.CoInitialize()
+                voice = win32com.client.Dispatch("SAPI.SpVoice")
+                voice.Rate = 0  # Standard conversational speed (-10 to +10)
+                voice.Volume = 100
+                voice.Speak(speech_text)
+                return
+            except Exception:
+                pass
+
+        # Layer 2: pyttsx3 engine
+        if pyttsx3 is not None:
+            try:
+                engine = pyttsx3.init()
+                engine.setProperty("rate", 175)
+                engine.setProperty("volume", 1.0)
+                engine.say(speech_text)
+                engine.runAndWait()
+                return
+            except Exception:
+                pass
+
+        # Layer 3: Native Windows PowerShell System.Speech Synthesizer fallback
         try:
-            with tts_lock:
-                tts_engine.say(text)
-                tts_engine.runAndWait()
+            escaped = speech_text.replace("'", "''").replace('"', '`"')
+            ps_cmd = f"Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{escaped}')"
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True,
+                timeout=15,
+            )
+            return
         except Exception:
             pass
 
@@ -217,7 +236,6 @@ def load_memory() -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Corrupted or invalid format -> safely reset
     try:
         with open(MEMORY_FILE, "w", encoding="utf-8") as f:
             json.dump(default_structure, f, indent=2)
@@ -246,7 +264,6 @@ def handle_remember(text: str) -> str:
     - 'remember that I am working on a data science project'
     - 'remember that my favorite programming language is Python'
     """
-    # Clean command prefix
     fact_text = re.sub(r"^(please\s+)?(remember\s+that|remember)\s+", "", text, flags=re.IGNORECASE).strip()
     fact_text = fact_text.rstrip(".").strip()
 
@@ -255,7 +272,6 @@ def handle_remember(text: str) -> str:
 
     mem = load_memory()
 
-    # Extract structured key/values if recognizable
     # 1. Name: "my name is X" / "I am X"
     name_match = re.search(r"\b(?:my name is|i am)\s+([A-Za-z\s]+)", fact_text, re.IGNORECASE)
     if name_match and "working" not in fact_text.lower():
@@ -272,7 +288,6 @@ def handle_remember(text: str) -> str:
         key = f"favorite_{fav_match.group(1).strip().lower()}"
         mem["facts"][key] = fav_match.group(2).strip()
 
-    # Store statement if not duplicate
     if fact_text not in mem["statements"]:
         mem["statements"].append(fact_text)
 
@@ -281,15 +296,13 @@ def handle_remember(text: str) -> str:
 
 
 def handle_memory_query(text: str) -> Optional[str]:
-    """
-    Retrieves information from personal memory.
-    """
+    """Retrieves information from personal memory."""
     t = text.lower().strip().rstrip("?.,")
     mem = load_memory()
     facts = mem.get("facts", {})
     statements = mem.get("statements", [])
 
-    # 1. "What do you remember about me?" / "Show memory"
+    # 1. General query
     if any(q in t for q in ["what do you remember about me", "what do you remember", "what is in your memory", "show my memory", "list my memories"]):
         if not statements and not facts:
             return "I don't have any stored memories about you yet. You can tell me by saying 'Remember that...'."
@@ -345,13 +358,11 @@ def handle_forget(text: str) -> str:
     mem = load_memory()
     removed = False
 
-    # Check facts
     for k in list(mem.get("facts", {}).keys()):
         if k in t or mem["facts"][k].lower() in t:
             del mem["facts"][k]
             removed = True
 
-    # Check statements
     new_statements = []
     for st in mem.get("statements", []):
         if t in st.lower() or any(w in st.lower() for w in t.split() if len(w) > 3):
@@ -369,7 +380,6 @@ def handle_forget(text: str) -> str:
 # =============================================================================
 # FEATURE 12: CONFIRMATION SYSTEM
 # =============================================================================
-# Global state for pending user confirmations
 PENDING_CONFIRMATION: Optional[Dict[str, Any]] = None
 
 
@@ -385,7 +395,6 @@ def check_confirmation(raw_input: str) -> Optional[Tuple[str, bool]]:
     cleaned = raw_input.lower().strip().rstrip(".,!")
     action = PENDING_CONFIRMATION.get("action")
 
-    # User confirms
     if cleaned in ["yes", "y", "confirm", "sure", "proceed", "do it", "yeah", "yep"]:
         PENDING_CONFIRMATION = None
         if action == "clear_memory":
@@ -398,12 +407,10 @@ def check_confirmation(raw_input: str) -> Optional[Tuple[str, bool]]:
             return "All stored memories have been permanently cleared.", False
         return "Action confirmed and executed.", False
 
-    # User declines
     elif cleaned in ["no", "n", "cancel", "stop", "nevermind", "abort", "don't", "nope"]:
         PENDING_CONFIRMATION = None
         return "Operation cancelled. Your data remains unchanged.", False
 
-    # Unclear response
     return "Please confirm with 'yes' to proceed or 'no' to cancel.", False
 
 
@@ -530,16 +537,12 @@ def handle_open_folder(query: str) -> Tuple[bool, str]:
 # FEATURE 4: VOLUME CONTROL
 # =============================================================================
 def handle_volume_control(query: str) -> Tuple[bool, str]:
-    """
-    Controls system volume (Increase, Decrease, Mute, Unmute, Set %).
-    Works via Windows virtual key events and pycaw if installed.
-    """
+    """Controls system volume (Increase, Decrease, Mute, Unmute, Set %)."""
     q = query.lower()
 
     # 1. Mute / Unmute
     if "mute" in q or "unmute" in q:
         try:
-            # VK_VOLUME_MUTE = 0xAD
             ctypes.windll.user32.keybd_event(0xAD, 0, 0, 0)
             ctypes.windll.user32.keybd_event(0xAD, 0, 2, 0)
             return True, "Volume muted or unmuted."
@@ -549,7 +552,6 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
     # 2. Increase volume
     if any(p in q for p in ["increase volume", "volume up", "turn up volume", "raise volume"]):
         try:
-            # Send 5 volume up key events (~10%)
             for _ in range(5):
                 ctypes.windll.user32.keybd_event(0xAF, 0, 0, 0)
                 ctypes.windll.user32.keybd_event(0xAF, 0, 2, 0)
@@ -560,7 +562,6 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
     # 3. Decrease volume
     if any(p in q for p in ["decrease volume", "volume down", "lower volume", "turn down volume"]):
         try:
-            # Send 5 volume down key events (~10%)
             for _ in range(5):
                 ctypes.windll.user32.keybd_event(0xAE, 0, 0, 0)
                 ctypes.windll.user32.keybd_event(0xAE, 0, 2, 0)
@@ -581,10 +582,9 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
                 volume = ctypes.cast(interface, ctypes.POINTER(IAudioEndpointVolume))
                 volume.SetMasterVolumeLevelScalar(percent / 100.0, None)
                 return True, f"Volume set to {percent} percent."
-            except Exception as e:
+            except Exception:
                 pass
 
-        # Fallback using keybd_event approximation: zero out then increase
         try:
             for _ in range(50):
                 ctypes.windll.user32.keybd_event(0xAE, 0, 0, 0)
@@ -604,20 +604,12 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
 # FEATURE 5: SAFE FILE SEARCH
 # =============================================================================
 def handle_file_search(query: str) -> Tuple[bool, str]:
-    """
-    Searches for files in safe user directories (Desktop, Documents, Downloads, Pictures).
-    Examples:
-    - 'Find my Python files'
-    - 'Find resume.pdf'
-    - 'Find files named project'
-    - 'Search my Downloads for CSV files'
-    """
+    """Searches for files in safe user directories (Desktop, Documents, Downloads, Pictures)."""
     q = query.lower()
     search_triggers = ["find", "search for file", "search for files", "search my", "locate file"]
     if not any(q.startswith(trig) or f" {trig} " in f" {q} " for trig in search_triggers):
         return False, ""
 
-    # Determine target directories
     user_dirs = get_user_directories()
     search_roots = [user_dirs["desktop"], user_dirs["documents"], user_dirs["downloads"], user_dirs["pictures"]]
 
@@ -630,8 +622,6 @@ def handle_file_search(query: str) -> Tuple[bool, str]:
     elif "picture" in q:
         search_roots = [user_dirs["pictures"]]
 
-    # Extract target pattern
-    # 1. Extension match: "python files" -> *.py, "csv files" -> *.csv, "pdf files" -> *.pdf
     ext_map = {
         "python": "*.py",
         "csv": "*.csv",
@@ -650,21 +640,16 @@ def handle_file_search(query: str) -> Tuple[bool, str]:
             target_pattern = pattern
             break
 
-    # 2. Specific filename: "find resume.pdf" or "find files named project"
     if not target_pattern:
         named_match = re.search(r"(?:find|search(?:\s+my\s+\w+)?\s+for)\s+(?:files?\s+named\s+|file\s+)?([a-zA-Z0-9_\-\.]+)", q)
         if named_match:
             candidate = named_match.group(1).strip()
             if candidate and candidate not in ["files", "file", "my", "all"]:
-                if "." in candidate:
-                    target_pattern = f"*{candidate}*"
-                else:
-                    target_pattern = f"*{candidate}*"
+                target_pattern = f"*{candidate}*"
 
     if not target_pattern:
         return False, ""
 
-    # Perform safe, bounded directory scan (max depth 3, max 500 files checked)
     matched_files = []
     scanned_count = 0
     max_scan = 500
@@ -674,10 +659,7 @@ def handle_file_search(query: str) -> Tuple[bool, str]:
             continue
         try:
             for root, dirs, files in os.walk(root_dir):
-                # Skip hidden/system directories
                 dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() not in ["appdata", "node_modules", ".git", "venv", "__pycache__"]]
-                
-                # Check depth
                 rel_path = os.path.relpath(root, root_dir)
                 depth = len(rel_path.split(os.sep)) if rel_path != "." else 0
                 if depth > 3:
@@ -690,7 +672,7 @@ def handle_file_search(query: str) -> Tuple[bool, str]:
                         break
 
                     if target_pattern.startswith("*."):
-                        ext_suffix = target_pattern[1:].lower()  # e.g. .py
+                        ext_suffix = target_pattern[1:].lower()
                         if f.lower().endswith(ext_suffix):
                             matched_files.append(os.path.join(root, f))
                     else:
@@ -721,10 +703,7 @@ SAFE_TEXT_EXTENSIONS = [".txt", ".csv", ".md", ".json", ".py", ".log", ".ini", "
 
 
 def handle_read_file(query: str) -> Tuple[bool, str]:
-    """
-    Safely reads and summarizes text-based files.
-    Example: 'Read my notes.txt' or 'Read file requirements.txt'
-    """
+    """Safely reads and summarizes text-based files."""
     q = query.strip()
     match = re.search(r"\bread\s+(?:my\s+|the\s+|file\s+)?([a-zA-Z0-9_\-\.\/\\]+)", q, re.IGNORECASE)
     if not match:
@@ -734,7 +713,6 @@ def handle_read_file(query: str) -> Tuple[bool, str]:
     if filename.lower() in ["time", "date", "screen", "news"]:
         return False, ""
 
-    # Candidates paths: current working directory, Desktop, Documents, Downloads
     user_dirs = get_user_directories()
     candidate_paths = [
         os.path.abspath(filename),
@@ -751,7 +729,6 @@ def handle_read_file(query: str) -> Tuple[bool, str]:
             break
 
     if not target_path:
-        # Search by filename in current dir & user folders
         for root_dir in [os.getcwd(), user_dirs["desktop"], user_dirs["documents"], user_dirs["downloads"]]:
             found = glob.glob(os.path.join(root_dir, f"*{filename}*"))
             if found and os.path.isfile(found[0]):
@@ -761,23 +738,20 @@ def handle_read_file(query: str) -> Tuple[bool, str]:
     if not target_path:
         return True, f"I could not find the file '{filename}' in your project or user folders."
 
-    # Validate safe extension
     _, ext = os.path.splitext(target_path)
     if ext.lower() not in SAFE_TEXT_EXTENSIONS:
         return True, f"For security reasons, I only read safe text-based files ({', '.join(SAFE_TEXT_EXTENSIONS)})."
 
     try:
         with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read(3000)  # Safe bounded read
+            content = f.read(3000)
 
         if not content.strip():
             return True, f"The file '{os.path.basename(target_path)}' is currently empty."
 
-        # If short, read directly; if longer, provide clear summary via Gemini or excerpt
         if len(content) < 200:
             return True, f"Here is the content of {os.path.basename(target_path)}:\n{content.strip()}"
 
-        # Summarize with Gemini if available
         summary_prompt = (
             f"Summarize the following contents of '{os.path.basename(target_path)}' in 2 concise, "
             f"professional sentences suitable for speech synthesis:\n\n{content}"
@@ -786,7 +760,6 @@ def handle_read_file(query: str) -> Tuple[bool, str]:
         if ai_summary and not ai_summary.startswith("I could not reach Gemini"):
             return True, f"Summary of {os.path.basename(target_path)}: {ai_summary}"
 
-        # Fallback excerpt
         excerpt = content[:250].strip().replace("\n", " ")
         return True, f"Read {os.path.basename(target_path)}: {excerpt}..."
 
@@ -798,10 +771,7 @@ def handle_read_file(query: str) -> Tuple[bool, str]:
 # FEATURE 8: SCREEN VISION (GEMINI VISION)
 # =============================================================================
 def handle_screen_vision() -> str:
-    """
-    Captures a temporary screenshot and analyzes what is visible using Gemini Vision.
-    Security: The image is analyzed in-memory/temp file and not permanently stored.
-    """
+    """Captures a temporary screenshot and analyzes what is visible using Gemini Vision."""
     if ImageGrab is None:
         return "Pillow library is required for screen vision. Please run pip install Pillow."
 
@@ -813,9 +783,7 @@ def handle_screen_vision() -> str:
         return "The google-genai library is not installed. Please run pip install google-genai."
 
     try:
-        # Capture screenshot
         screenshot = ImageGrab.grab()
-        # Resize slightly for fast processing and optimal token usage
         screenshot.thumbnail((1280, 720))
 
         client = genai.Client(api_key=api_key)
@@ -866,7 +834,7 @@ class ChatBrain:
     def __init__(self):
         self.chat_session = None
         self.client = None
-        self.history: List[Dict[str, str]] = []  # Rolling 6-turn session history
+        self.history: List[Dict[str, str]] = []
         self._initialize_chat()
 
     def _get_contextual_instruction(self) -> str:
@@ -943,7 +911,6 @@ class ChatBrain:
             response = None
             last_err = None
 
-            # Build rolling context for fallback
             context_prompt = ""
             if self.history:
                 recent = self.history[-3:]
@@ -1138,7 +1105,7 @@ def handle_system_status() -> str:
     """Returns current comprehensive system & assistant status."""
     ai_status = "Connected" if os.environ.get("GEMINI_API_KEY") else "Offline (No API Key)"
     mic_status = "Ready" if sr is not None else "Keyboard Mode"
-    speaker_status = "Ready (Windows SAPI)" if sapi_voice is not None else ("Ready (pyttsx3)" if tts_engine else "Text-only")
+    speaker_status = "Ready (Windows SAPI)" if WIN32COM_AVAILABLE else ("Ready (pyttsx3)" if pyttsx3 else "Text-only")
     
     mem = load_memory()
     mem_count = len(mem.get("facts", {})) + len(mem.get("statements", []))
@@ -1293,7 +1260,6 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
     prompt = strip_wake_word(raw_input)
     prompt_lower = prompt.lower().strip()
 
-    # Empty prompt after wake word
     if not prompt_lower:
         return "Yes, I am listening. How can I assist you?", False
 
@@ -1347,20 +1313,16 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
         return handle_screenshot(), False
 
     # 10. Memory Commands
-    # Clear memory (requires confirmation)
     if re.search(r"\b(clear|reset|erase|wipe)\s+(?:all\s+)?(?:of\s+)?(?:my\s+)?(?:stored\s+)?(memor(?:y|ies))\b", prompt_lower) or "forget everything" in prompt_lower:
         PENDING_CONFIRMATION = {"action": "clear_memory"}
         return "This will permanently remove all stored memories. Are you sure?", False
 
-    # Forget fact
     if prompt_lower.startswith("forget that") or prompt_lower.startswith("forget "):
         return handle_forget(prompt), False
 
-    # Remember fact
     if prompt_lower.startswith("remember that") or prompt_lower.startswith("remember "):
         return handle_remember(prompt), False
 
-    # Memory retrieval query
     mem_resp = handle_memory_query(prompt)
     if mem_resp:
         return mem_resp, False
@@ -1608,11 +1570,9 @@ def main():
     else:
         print("[Microphone: Not detected. Interactive keyboard input mode enabled]")
 
-    # Startup Greeting
     startup_greeting = get_greeting()
     speak(startup_greeting)
 
-    # Main interaction loop
     while True:
         try:
             raw_input = listen(recognizer, mic_backend)
