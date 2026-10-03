@@ -550,7 +550,7 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
             return True, f"Failed to toggle volume mute: {e}"
 
     # 2. Increase volume
-    if any(p in q for p in ["increase volume", "volume up", "turn up volume", "raise volume"]):
+    if any(p in q for p in ["increase volume", "volume up", "turn up volume", "raise volume", "louder"]):
         try:
             for _ in range(5):
                 ctypes.windll.user32.keybd_event(0xAF, 0, 0, 0)
@@ -560,7 +560,7 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
             return True, f"Failed to increase volume: {e}"
 
     # 3. Decrease volume
-    if any(p in q for p in ["decrease volume", "volume down", "lower volume", "turn down volume"]):
+    if any(p in q for p in ["decrease volume", "volume down", "lower volume", "turn down volume", "softer"]):
         try:
             for _ in range(5):
                 ctypes.windll.user32.keybd_event(0xAE, 0, 0, 0)
@@ -792,7 +792,7 @@ def handle_screen_vision() -> str:
             "Identify the active application, editor, document, or webpage visible."
         )
 
-        vision_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        vision_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-3.5-flash-lite", "gemini-3.7-flash"]
         response = None
         last_err = None
 
@@ -905,8 +905,8 @@ class ChatBrain:
             models_to_try = [
                 "gemini-2.5-flash",
                 "gemini-2.0-flash",
-                "gemini-1.5-flash",
                 "gemini-3.5-flash-lite",
+                "gemini-3.7-flash",
             ]
             response = None
             last_err = None
@@ -1227,13 +1227,33 @@ def strip_wake_word(text: str) -> str:
     return cleaned
 
 
+def is_exit_command(text: str) -> bool:
+    """Checks if the user requested to exit or go offline."""
+    t = text.lower().strip().rstrip(".,!")
+    exit_patterns = [
+        r"\b(?:go\s+)?offline\b",
+        r"\b(?:go\s+to\s+)?sleep\b",
+        r"\bshut\s*down\b",
+        r"\bturn\s*off\b",
+        r"\bexit\b",
+        r"\bquit\b",
+        r"\bgoodbye\b",
+        r"\bbye\b",
+        r"\bterminate\b",
+        r"\bclose\s+jarvis\b",
+        r"\bstop\s+jarvis\b",
+        r"\bstop\b",
+    ]
+    return any(re.search(pat, t) for pat in exit_patterns)
+
+
 def route_command(raw_input: str) -> Tuple[str, bool]:
     """
     Main V2 command priority routing pipeline:
     1. Normalize text
     2. Check pending confirmation state
     3. Check wake word
-    4. Check exit commands
+    4. Check exit / offline commands
     5. Check help & system status commands
     6. Check screen vision
     7. Check volume control
@@ -1257,15 +1277,17 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
     if conf_result is not None:
         return conf_result
 
+    # 2. Check exit on raw input before and after wake word stripping
+    if is_exit_command(raw_input):
+        return "Goodbye. JARVIS going offline.", True
+
     prompt = strip_wake_word(raw_input)
     prompt_lower = prompt.lower().strip()
 
     if not prompt_lower:
         return "Yes, I am listening. How can I assist you?", False
 
-    # 2. Exit Commands
-    exit_triggers = ["goodbye", "exit", "quit", "shutdown", "bye", "go offline", "terminate"]
-    if any(prompt_lower == trig or prompt_lower.startswith(trig) for trig in exit_triggers):
+    if is_exit_command(prompt):
         return "Goodbye. JARVIS going offline.", True
 
     # 3. Conversational Greetings
@@ -1380,8 +1402,8 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
 def record_with_sounddevice(
     fs: int = 16000,
     max_seconds: float = 12.0,
-    silence_limit: float = 1.3,
-    listen_timeout: float = 6.0,
+    silence_limit: float = 1.0,
+    listen_timeout: float = 5.0,
 ) -> Optional[object]:
     """
     Captures voice from Windows default microphone using sounddevice.
@@ -1398,13 +1420,13 @@ def record_with_sounddevice(
     try:
         with sd.InputStream(samplerate=fs, channels=1, dtype="int16") as stream:
             ambient_energies = []
-            for _ in range(max(1, int(fs / block_size * 0.3))):
+            for _ in range(max(1, int(fs / block_size * 0.2))):
                 data, _ = stream.read(block_size)
                 rms = np.sqrt(np.mean(data.astype(np.float32) ** 2))
                 ambient_energies.append(rms)
 
             avg_ambient = float(np.mean(ambient_energies)) if ambient_energies else 30.0
-            speech_threshold = max(avg_ambient * 1.4, 180.0)
+            speech_threshold = max(avg_ambient * 1.3, 120.0)
 
             print("\nLISTENING... (Speak now or type command)")
 
