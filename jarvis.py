@@ -259,37 +259,55 @@ def save_memory(data: Dict[str, Any]) -> bool:
 def handle_remember(text: str) -> str:
     """
     Stores an explicit personal fact into memory.
-    Examples:
+    Handles various natural voice inputs:
     - 'remember that my name is Zeeshan'
+    - 'remember my name is Zeeshan'
+    - 'remember my name my name is Zeeshan'
     - 'remember that I am working on a data science project'
     - 'remember that my favorite programming language is Python'
     """
-    fact_text = re.sub(r"^(please\s+)?(remember\s+that|remember)\s+", "", text, flags=re.IGNORECASE).strip()
+    # Clean leading command triggers
+    fact_text = re.sub(
+        r"^(?:please\s+|can\s+you\s+)?(?:remember\s+that|remember|save\s+in\s+memory(?:\s+that)?)\s+",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
     fact_text = fact_text.rstrip(".").strip()
 
     if not fact_text:
         return "What would you like me to remember?"
 
     mem = load_memory()
+    if "facts" not in mem:
+        mem["facts"] = {}
+    if "statements" not in mem:
+        mem["statements"] = []
 
-    # 1. Name: "my name is X" / "I am X"
-    name_match = re.search(r"\b(?:my name is|i am)\s+([A-Za-z\s]+)", fact_text, re.IGNORECASE)
+    # 1. Name: "my name is X" / "my name my name is X" / "i am X"
+    name_match = re.search(r"(?:my name is|my name my name is|i am)\s+([A-Za-z\s]+)", fact_text, re.IGNORECASE)
     if name_match and "working" not in fact_text.lower():
-        mem["facts"]["name"] = name_match.group(1).strip().title()
+        extracted_name = name_match.group(1).strip().title()
+        # Clean trailing filler words
+        extracted_name = re.sub(r"\b(please|thanks|thank you)\b", "", extracted_name, flags=re.IGNORECASE).strip()
+        if extracted_name:
+            mem["facts"]["name"] = extracted_name
 
     # 2. Project: "i am working on X" / "my project is X"
-    proj_match = re.search(r"\b(?:i am working on|my project is|working on)\s+(?:a|an|the)?\s*([^,\.]+)", fact_text, re.IGNORECASE)
+    proj_match = re.search(r"(?:i am working on|my project is|working on)\s+(?:a|an|the)?\s*([^,\.]+)", fact_text, re.IGNORECASE)
     if proj_match:
         mem["facts"]["project"] = proj_match.group(1).strip()
 
-    # 3. Favorite [thing] is [value]
-    fav_match = re.search(r"\bmy favorite\s+([a-zA-Z\s]+?)\s+is\s+([^,\.]+)", fact_text, re.IGNORECASE)
+    # 3. Favorite [thing] is [value] / Favorite language is Python
+    fav_match = re.search(r"my favorite\s+([a-zA-Z\s]+?)\s+is\s+([^,\.]+)", fact_text, re.IGNORECASE)
     if fav_match:
         key = f"favorite_{fav_match.group(1).strip().lower()}"
         mem["facts"][key] = fav_match.group(2).strip()
 
-    if fact_text not in mem["statements"]:
-        mem["statements"].append(fact_text)
+    # Store statement if not duplicate
+    clean_statement = fact_text
+    if clean_statement not in mem["statements"]:
+        mem["statements"].append(clean_statement)
 
     save_memory(mem)
     return "I'll remember that."
@@ -297,13 +315,16 @@ def handle_remember(text: str) -> str:
 
 def handle_memory_query(text: str) -> Optional[str]:
     """Retrieves information from personal memory."""
-    t = text.lower().strip().rstrip("?.,")
+    t = text.lower().strip().rstrip("?.,!")
     mem = load_memory()
     facts = mem.get("facts", {})
     statements = mem.get("statements", [])
 
-    # 1. General query
-    if any(q in t for q in ["what do you remember about me", "what do you remember", "what is in your memory", "show my memory", "list my memories"]):
+    # 1. "What do you remember about me?" / "What is in your memory?"
+    if any(q in t for q in [
+        "what do you remember about me", "what do you remember", "what is in your memory",
+        "show my memory", "show memories", "list my memories", "list memories", "tell me what you remember"
+    ]):
         if not statements and not facts:
             return "I don't have any stored memories about you yet. You can tell me by saying 'Remember that...'."
         
@@ -317,36 +338,38 @@ def handle_memory_query(text: str) -> Optional[str]:
                 subj = k.replace("favorite_", "")
                 items.append(f"Your favorite {subj} is {v}.")
         for st in statements:
-            formatted = f"You mentioned that {st}."
-            if formatted not in items and not any(facts.get(k, "") in st for k in ["name", "project"]):
+            formatted = f"You mentioned: {st}."
+            if not any(facts.get(k, "") in st for k in ["name", "project"]):
                 items.append(formatted)
 
         return "Here is what I remember about you: " + " ".join(items)
 
-    # 2. Specific questions
-    if "what is my name" in t or "who am i" in t:
+    # 2. Name questions
+    if any(q in t for q in ["what is my name", "what's my name", "who am i", "do you know my name", "tell me my name"]):
         if "name" in facts:
             return f"Your name is {facts['name']}."
         for st in statements:
             if "name is" in st.lower():
                 return f"According to my memory, {st}."
 
-    if "what project" in t or "which project" in t or "project am i working on" in t:
+    # 3. Project questions
+    if any(q in t for q in ["what project", "which project", "project am i working on", "what am i working on"]):
         if "project" in facts:
-            return f"You are working on a {facts['project']}."
+            return f"You are working on {facts['project']}."
         for st in statements:
             if "working on" in st.lower() or "project" in st.lower():
                 return f"You are {st}."
 
-    if "favorite" in t and "what is" in t:
-        fav_match = re.search(r"what is my favorite\s+([a-zA-Z\s]+)", t)
+    # 4. Favorite questions
+    if "favorite" in t:
+        fav_match = re.search(r"(?:what is|what's|tell me)\s+my favorite\s+([a-zA-Z\s]+)", t)
         if fav_match:
             subj = fav_match.group(1).strip().lower()
             key = f"favorite_{subj}"
             if key in facts:
                 return f"Your favorite {subj} is {facts[key]}."
             for k, v in facts.items():
-                if subj in k:
+                if subj in k or k.replace("favorite_", "") in subj:
                     return f"Your favorite {k.replace('favorite_', '')} is {v}."
 
     return None
@@ -354,7 +377,7 @@ def handle_memory_query(text: str) -> Optional[str]:
 
 def handle_forget(text: str) -> str:
     """Removes a specific memory fact."""
-    t = re.sub(r"^(please\s+)?(forget\s+that|forget)\s+", "", text, flags=re.IGNORECASE).strip().rstrip(".").lower()
+    t = re.sub(r"^(?:please\s+)?(?:forget\s+that|forget|delete\s+memory(?:\s+of)?)\s+", "", text, flags=re.IGNORECASE).strip().rstrip(".").lower()
     mem = load_memory()
     removed = False
 
@@ -395,7 +418,7 @@ def check_confirmation(raw_input: str) -> Optional[Tuple[str, bool]]:
     cleaned = raw_input.lower().strip().rstrip(".,!")
     action = PENDING_CONFIRMATION.get("action")
 
-    if cleaned in ["yes", "y", "confirm", "sure", "proceed", "do it", "yeah", "yep"]:
+    if cleaned in ["yes", "y", "confirm", "sure", "proceed", "do it", "yeah", "yep", "ok", "okay"]:
         PENDING_CONFIRMATION = None
         if action == "clear_memory":
             default_mem = {
@@ -418,6 +441,30 @@ def check_confirmation(raw_input: str) -> Optional[Tuple[str, bool]]:
 # FEATURE 2: SAFE APPLICATION CONTROL
 # =============================================================================
 SAFE_APP_MAP = {
+    "whatsapp": {
+        "uri": "whatsapp:",
+        "cmd": "whatsapp",
+        "name": "WhatsApp",
+        "web": "https://web.whatsapp.com",
+    },
+    "spotify": {
+        "uri": "spotify:",
+        "cmd": "spotify",
+        "name": "Spotify",
+        "web": "https://open.spotify.com",
+    },
+    "discord": {
+        "uri": "discord:",
+        "cmd": "discord",
+        "name": "Discord",
+        "web": "https://discord.com/app",
+    },
+    "telegram": {
+        "uri": "tg:",
+        "cmd": "telegram",
+        "name": "Telegram",
+        "web": "https://web.telegram.org",
+    },
     "chrome": {"cmd": "chrome", "name": "Google Chrome"},
     "google chrome": {"cmd": "chrome", "name": "Google Chrome"},
     "vs code": {"cmd": "code", "name": "Visual Studio Code"},
@@ -430,12 +477,17 @@ SAFE_APP_MAP = {
     "explorer": {"cmd": "explorer.exe", "name": "File Explorer"},
     "microsoft edge": {"cmd": "msedge", "name": "Microsoft Edge"},
     "edge": {"cmd": "msedge", "name": "Microsoft Edge"},
-    "spotify": {"cmd": "spotify", "name": "Spotify"},
     "task manager": {"cmd": "taskmgr.exe", "name": "Task Manager"},
     "paint": {"cmd": "mspaint.exe", "name": "Paint"},
     "cmd": {"cmd": "cmd.exe", "name": "Command Prompt"},
+    "command prompt": {"cmd": "cmd.exe", "name": "Command Prompt"},
     "terminal": {"cmd": "wt.exe", "name": "Windows Terminal"},
     "powershell": {"cmd": "powershell.exe", "name": "PowerShell"},
+    "settings": {"uri": "ms-settings:", "name": "Windows Settings"},
+    "windows settings": {"uri": "ms-settings:", "name": "Windows Settings"},
+    "word": {"cmd": "winword.exe", "name": "Microsoft Word"},
+    "excel": {"cmd": "excel.exe", "name": "Microsoft Excel"},
+    "powerpoint": {"cmd": "powerpnt.exe", "name": "Microsoft PowerPoint"},
 }
 
 KNOWN_APP_PATHS = {
@@ -452,6 +504,14 @@ KNOWN_APP_PATHS = {
         os.path.expandvars(r"%APPDATA%\Spotify\Spotify.exe"),
         os.path.expandvars(r"%LocalAppData%\Microsoft\WindowsApps\Spotify.exe"),
     ],
+    "whatsapp": [
+        os.path.expandvars(r"%LocalAppData%\WhatsApp\WhatsApp.exe"),
+        os.path.expandvars(r"%ProgramFiles%\WhatsApp\WhatsApp.exe"),
+        os.path.expandvars(r"%LocalAppData%\Microsoft\WindowsApps\WhatsApp.exe"),
+    ],
+    "discord": [
+        os.path.expandvars(r"%LocalAppData%\Discord\Update.exe --processStart Discord.exe"),
+    ],
     "code": [
         os.path.expandvars(r"%LocalAppData%\Programs\Microsoft VS Code\Code.exe"),
         os.path.expandvars(r"%ProgramFiles%\Microsoft VS Code\Code.exe"),
@@ -460,39 +520,80 @@ KNOWN_APP_PATHS = {
 
 
 def handle_open_app(query: str) -> Tuple[bool, str]:
-    """Safely launches predefined Windows applications."""
-    for key, app_data in SAFE_APP_MAP.items():
-        pattern = rf"\b(open|launch|start)?\s*{re.escape(key)}\b"
-        if re.search(pattern, query, re.IGNORECASE):
-            cmd = app_data["cmd"]
-            name = app_data["name"]
+    """Safely launches predefined Windows applications or Windows URI schemes."""
+    q = query.lower().strip()
 
-            # 1. Try PATH
-            if shutil.which(cmd):
+    for key, app_data in SAFE_APP_MAP.items():
+        pattern = rf"\b(?:open|launch|start)?\s*{re.escape(key)}\b"
+        if re.search(pattern, q):
+            name = app_data.get("name", key.title())
+
+            # 1. Try URI scheme if defined (e.g. whatsapp:, spotify:, ms-settings:)
+            if "uri" in app_data:
+                try:
+                    os.system(f"start {app_data['uri']}")
+                    return True, f"Opening {name}."
+                except Exception:
+                    pass
+
+            # 2. Try PATH binary
+            cmd = app_data.get("cmd")
+            if cmd and shutil.which(cmd):
                 try:
                     subprocess.Popen([cmd], shell=True)
                     return True, f"Opening {name}."
                 except Exception as e:
                     return True, f"Failed to launch {name}: {e}"
 
-            # 2. Try known absolute paths
-            if cmd in KNOWN_APP_PATHS:
-                for path in KNOWN_APP_PATHS[cmd]:
-                    if os.path.exists(path):
+            # 3. Try known absolute installation paths
+            if key in KNOWN_APP_PATHS:
+                for path in KNOWN_APP_PATHS[key]:
+                    if os.path.exists(path.split(" --")[0]):
                         try:
                             os.startfile(path)
                             return True, f"Opening {name}."
                         except Exception as e:
                             return True, f"Failed to start {name}: {e}"
 
-            # 3. Direct startfile
+            # 4. Try direct command with startfile
+            if cmd:
+                try:
+                    os.startfile(cmd)
+                    return True, f"Opening {name}."
+                except Exception:
+                    pass
+
+            # 5. Fallback to Web version if available (e.g. WhatsApp Web / Spotify Web)
+            if "web" in app_data:
+                try:
+                    webbrowser.open(app_data["web"])
+                    return True, f"Opening {name} Web in your browser."
+                except Exception:
+                    pass
+
+            return True, f"I couldn't find {name} installed on your system."
+
+    # Catch-all for generic 'open [app]' phrase
+    open_match = re.search(r"\b(?:open|launch|start)\s+([a-zA-Z0-9_\-]+)\b", q)
+    if open_match:
+        app_name = open_match.group(1).strip()
+        if app_name not in ["the", "my", "a", "an", "folder", "file", "time", "date", "cpu", "ram", "memory"]:
+            # Try PATH
+            if shutil.which(app_name):
+                try:
+                    subprocess.Popen([app_name], shell=True)
+                    return True, f"Opening {app_name.title()}."
+                except Exception:
+                    pass
+            # Try Windows URI protocol: start app_name:
             try:
-                os.startfile(cmd)
-                return True, f"Opening {name}."
+                ret = os.system(f"start {app_name}: 2>nul")
+                if ret == 0:
+                    return True, f"Opening {app_name.title()}."
             except Exception:
                 pass
 
-            return True, f"I couldn't find {name} installed on your system."
+            return True, f"I couldn't find {app_name.title()} installed on your system."
 
     return False, ""
 
@@ -519,7 +620,7 @@ def handle_open_folder(query: str) -> Tuple[bool, str]:
     q = query.lower()
 
     for name, path in folders.items():
-        pattern = rf"\bopen\s+(?:my\s+)?{name}(?:\s+folder)?\b"
+        pattern = rf"\b(?:open|show|explore)\s+(?:my\s+)?{name}(?:\s+folder)?\b"
         if re.search(pattern, q):
             if os.path.exists(path):
                 try:
@@ -604,9 +705,16 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
 # FEATURE 5: SAFE FILE SEARCH
 # =============================================================================
 def handle_file_search(query: str) -> Tuple[bool, str]:
-    """Searches for files in safe user directories (Desktop, Documents, Downloads, Pictures)."""
+    """
+    Searches for files in safe user directories (Desktop, Documents, Downloads, Pictures).
+    Examples:
+    - 'Find my Python files'
+    - 'Find resume.pdf'
+    - 'Find files named project'
+    - 'Search my Downloads for CSV files'
+    """
     q = query.lower()
-    search_triggers = ["find", "search for file", "search for files", "search my", "locate file"]
+    search_triggers = ["find", "search for file", "search for files", "search my", "locate file", "where is my file"]
     if not any(q.startswith(trig) or f" {trig} " in f" {q} " for trig in search_triggers):
         return False, ""
 
@@ -624,6 +732,7 @@ def handle_file_search(query: str) -> Tuple[bool, str]:
 
     ext_map = {
         "python": "*.py",
+        "py": "*.py",
         "csv": "*.csv",
         "pdf": "*.pdf",
         "text": "*.txt",
@@ -636,16 +745,22 @@ def handle_file_search(query: str) -> Tuple[bool, str]:
 
     target_pattern = None
     for name, pattern in ext_map.items():
-        if f"{name} file" in q or f"{name} files" in q:
+        if f"{name} file" in q or f"{name} files" in q or q.endswith(f"for {name}"):
             target_pattern = pattern
             break
 
     if not target_pattern:
-        named_match = re.search(r"(?:find|search(?:\s+my\s+\w+)?\s+for)\s+(?:files?\s+named\s+|file\s+)?([a-zA-Z0-9_\-\.]+)", q)
+        named_match = re.search(
+            r"(?:find|search(?:\s+my\s+\w+)?\s+for)\s+(?:files?\s+named\s+|file\s+|files\s+)?([a-zA-Z0-9_\-\.]+)",
+            q,
+        )
         if named_match:
             candidate = named_match.group(1).strip()
             if candidate and candidate not in ["files", "file", "my", "all"]:
-                target_pattern = f"*{candidate}*"
+                if candidate in ext_map:
+                    target_pattern = ext_map[candidate]
+                else:
+                    target_pattern = f"*{candidate}*"
 
     if not target_pattern:
         return False, ""
@@ -659,7 +774,10 @@ def handle_file_search(query: str) -> Tuple[bool, str]:
             continue
         try:
             for root, dirs, files in os.walk(root_dir):
-                dirs[:] = [d for d in dirs if not d.startswith(".") and d.lower() not in ["appdata", "node_modules", ".git", "venv", "__pycache__"]]
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith(".") and d.lower() not in ["appdata", "node_modules", ".git", "venv", "__pycache__"]
+                ]
                 rel_path = os.path.relpath(root, root_dir)
                 depth = len(rel_path.split(os.sep)) if rel_path != "." else 0
                 if depth > 3:
@@ -703,7 +821,10 @@ SAFE_TEXT_EXTENSIONS = [".txt", ".csv", ".md", ".json", ".py", ".log", ".ini", "
 
 
 def handle_read_file(query: str) -> Tuple[bool, str]:
-    """Safely reads and summarizes text-based files."""
+    """
+    Safely reads and summarizes text-based files.
+    Example: 'Read my notes.txt' or 'Read file requirements.txt'
+    """
     q = query.strip()
     match = re.search(r"\bread\s+(?:my\s+|the\s+|file\s+)?([a-zA-Z0-9_\-\.\/\\]+)", q, re.IGNORECASE)
     if not match:
@@ -1088,7 +1209,7 @@ def handle_help() -> str:
     return (
         "JARVIS can currently:\n"
         "• Answer questions & converse using Gemini AI\n"
-        "• Open applications (Chrome, VS Code, Spotify, etc.)\n"
+        "• Open applications (Chrome, WhatsApp, VS Code, Spotify, etc.)\n"
         "• Open user folders (Downloads, Documents, Desktop, Pictures)\n"
         "• Search the web & open websites\n"
         "• Control system volume (Up, Down, Mute, Set %)\n"
@@ -1221,7 +1342,7 @@ def strip_wake_word(text: str) -> str:
         return ""
     
     cleaned = text.strip()
-    cleaned = re.sub(r"\b(hey\s+|ok\s+|okay\s+)?jarvis\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(?:hey\s+|ok\s+|okay\s+)?jarvis\b", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"^[\s,\.\!\?]+", "", cleaned)
     cleaned = re.sub(r"[\s,\.\!\?]+$", "", cleaned).strip()
     return cleaned
@@ -1242,7 +1363,6 @@ def is_exit_command(text: str) -> bool:
         r"\bterminate\b",
         r"\bclose\s+jarvis\b",
         r"\bstop\s+jarvis\b",
-        r"\bstop\b",
     ]
     return any(re.search(pat, t) for pat in exit_patterns)
 
@@ -1250,21 +1370,20 @@ def is_exit_command(text: str) -> bool:
 def route_command(raw_input: str) -> Tuple[str, bool]:
     """
     Main V2 command priority routing pipeline:
-    1. Normalize text
+    1. Normalize text & strip wake word
     2. Check pending confirmation state
-    3. Check wake word
-    4. Check exit / offline commands
-    5. Check help & system status commands
-    6. Check screen vision
-    7. Check volume control
-    8. Check local commands (time, date, CPU, RAM, OS, screenshot)
-    9. Check memory commands (remember, recall, forget, clear)
-    10. Check file search & read text files
-    11. Check folder control (Downloads, Documents, etc.)
-    12. Check web search & website opening
-    13. Check application control (Chrome, VS Code, Spotify, etc.)
-    14. Check safe mathematical calculator
-    15. Route to Gemini AI Brain with rolling session history and personal memory context
+    3. Check exit / offline commands
+    4. Check help & system status commands
+    5. Check screen vision
+    6. Check volume control
+    7. Check local commands (time, date, CPU, RAM, OS, screenshot)
+    8. Check memory commands (remember, recall, forget, clear)
+    9. Check file search & read text files
+    10. Check folder control (Downloads, Documents, etc.)
+    11. Check web search & website opening
+    12. Check application control (Chrome, WhatsApp, VS Code, Spotify, etc.)
+    13. Check safe mathematical calculator
+    14. Fallback to Gemini AI Brain with rolling session history and personal memory context
     Returns (response_text, should_exit)
     """
     global PENDING_CONFIRMATION
@@ -1301,7 +1420,7 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
     if prompt_lower in ["help", "what can you do", "show commands", "commands"]:
         return handle_help(), False
 
-    if any(p in prompt_lower for p in ["system status", "status report", "jarvis status"]):
+    if any(p in prompt_lower for p in ["system status", "status report", "jarvis status", "about system status", "tell me about system status"]):
         return handle_system_status(), False
 
     # 5. Screen Vision
@@ -1335,14 +1454,19 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
         return handle_screenshot(), False
 
     # 10. Memory Commands
-    if re.search(r"\b(clear|reset|erase|wipe)\s+(?:all\s+)?(?:of\s+)?(?:my\s+)?(?:stored\s+)?(memor(?:y|ies))\b", prompt_lower) or "forget everything" in prompt_lower:
+    if re.search(r"\b(?:clear|reset|erase|wipe)\s+(?:all\s+)?(?:of\s+)?(?:my\s+)?(?:stored\s+)?(?:memor(?:y|ies))\b", prompt_lower) or "forget everything" in prompt_lower:
         PENDING_CONFIRMATION = {"action": "clear_memory"}
         return "This will permanently remove all stored memories. Are you sure?", False
 
     if prompt_lower.startswith("forget that") or prompt_lower.startswith("forget "):
         return handle_forget(prompt), False
 
-    if prompt_lower.startswith("remember that") or prompt_lower.startswith("remember "):
+    if (
+        prompt_lower.startswith("remember")
+        or "remember that" in prompt_lower
+        or "remember my name" in prompt_lower
+        or "save in memory" in prompt_lower
+    ):
         return handle_remember(prompt), False
 
     mem_resp = handle_memory_query(prompt)
@@ -1360,7 +1484,7 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
         return search_file_resp, False
 
     # 13. Folder Control
-    if "open" in prompt_lower or "launch" in prompt_lower:
+    if "open" in prompt_lower or "launch" in prompt_lower or "explore" in prompt_lower:
         handled_folder, folder_resp = handle_open_folder(prompt_lower)
         if handled_folder:
             return folder_resp, False
@@ -1371,7 +1495,7 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
         return search_resp, False
 
     # 15. Open Websites
-    if "open" in prompt_lower or "launch" in prompt_lower:
+    if "open" in prompt_lower or "launch" in prompt_lower or "start" in prompt_lower:
         handled_web, web_resp = handle_open_website(prompt_lower)
         if handled_web:
             return web_resp, False
