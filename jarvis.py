@@ -478,6 +478,46 @@ def check_confirmation(raw_input: str) -> Optional[Tuple[str, bool]]:
 
 
 # =============================================================================
+# SMART CONTEXT & ENTITY EXTRACTION SYSTEM
+# =============================================================================
+class ConversationContext:
+    """
+    Maintains a lightweight, non-sticky conversation context object:
+    - last_intent: e.g., 'OPEN_FOLDER', 'FILE_SEARCH', 'OPEN_WEBSITE', 'OPEN_APP'
+    - last_location: e.g., 'Downloads', 'Desktop', 'Documents'
+    - last_search_query: e.g., 'Week 4 video', 'resume'
+    - last_found_files: list of full absolute file paths from the latest search
+    - last_opened_file: file path of most recently opened file
+    - last_opened_application: name of most recently launched application
+    """
+    def __init__(self):
+        self.last_intent = None
+        self.last_location = None
+        self.last_search_query = None
+        self.last_found_files = []
+        self.last_opened_file = None
+        self.last_opened_application = None
+        self.last_action_time = time.time()
+
+    def update(self, **kwargs):
+        for k, v in kwargs.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+        self.last_action_time = time.time()
+
+    def clear(self):
+        self.last_intent = None
+        self.last_location = None
+        self.last_search_query = None
+        self.last_found_files = []
+        self.last_opened_file = None
+        self.last_opened_application = None
+
+
+context = ConversationContext()
+
+
+# =============================================================================
 # SYSTEM 2: COMPREHENSIVE WINDOWS USER FILE SEARCH & LAUNCHER
 # =============================================================================
 def get_user_search_roots() -> List[str]:
@@ -523,9 +563,9 @@ def search_user_files(
     """
     search_roots = get_user_search_roots()
     if specific_folder:
-        search_roots = [r for r in search_roots if specific_folder.lower() in r.lower()]
-        if not search_roots:
-            search_roots = get_user_search_roots()
+        matched_roots = [r for r in search_roots if specific_folder.lower() in r.lower()]
+        if matched_roots:
+            search_roots = matched_roots
 
     matched_files: List[Tuple[int, str]] = []  # (score, path)
     scanned_count = 0
@@ -533,7 +573,7 @@ def search_user_files(
     cleaned_query = query_term.lower().strip()
     query_words = [
         w for w in re.findall(r"\b[a-zA-Z0-9_\-]+\b", cleaned_query)
-        if w not in ["my", "the", "file", "files", "pdf", "txt", "csv", "doc", "docx"]
+        if w not in ["my", "the", "file", "files", "pdf", "txt", "csv", "doc", "docx", "video", "videos"]
     ]
 
     for root_dir in search_roots:
@@ -601,34 +641,44 @@ def search_user_files(
     return unique_matches
 
 
-def extract_search_target(query: str) -> Tuple[str, Optional[str], Optional[str]]:
+def extract_search_target(query: str, current_context: Optional[ConversationContext] = None) -> Tuple[str, Optional[str], Optional[str]]:
     """
     Extracts search term, target extension, and specific folder from natural phrasing.
-    Examples:
-    - 'Find my resume' -> ('resume', None, None)
-    - 'Find resume.pdf' -> ('resume', '.pdf', None)
-    - 'Find CSV files' -> ('', '.csv', None)
-    - 'Search my Downloads for GST assignment' -> ('GST assignment', None, 'Downloads')
-    - 'Find my GST assignment PDF' -> ('GST assignment', '.pdf', None)
+    Understands:
+    - Explicit folders: 'in Downloads', 'on Desktop', 'in Documents', etc.
+    - Contextual location references: 'there', 'in that folder' -> uses context.last_location.
+    - Extensions: '.pdf', '.txt', '.csv', '.py', 'video', 'pdf files', 'word document'.
     """
     q = query.strip()
     q_lower = q.lower()
     
-    # 1. Check for specific folder
+    # 1. Check for explicit folder
     specific_folder = None
-    for fld in ["downloads", "documents", "desktop", "pictures", "videos", "music", "onedrive"]:
-        if f"in {fld}" in q_lower or f"my {fld}" in q_lower or f"from {fld}" in q_lower:
-            specific_folder = fld
+    folder_keywords = ["downloads", "documents", "desktop", "pictures", "videos", "music", "onedrive"]
+    for fld in folder_keywords:
+        if (
+            f"in {fld}" in q_lower
+            or f"on {fld}" in q_lower
+            or f"from {fld}" in q_lower
+            or f"my {fld}" in q_lower
+            or f"under {fld}" in q_lower
+        ):
+            specific_folder = fld.title()
             break
 
-    # 2. Check for explicit file with extension like 'test_notes.txt', 'GST_Assignment.pdf'
-    match_file = re.search(r"\b([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]{2,4})\b", q)
+    # 2. Check for contextual reference 'there' or 'in that folder'
+    if not specific_folder and current_context and current_context.last_location:
+        if re.search(r"\b(?:there|in\s+there|in\s+that\s+folder|in\s+the\s+folder)\b", q_lower):
+            specific_folder = current_context.last_location
+
+    # 3. Check for explicit file with extension like 'test_notes.txt', 'GST_Assignment.pdf', 'Week 4.mp4'
+    match_file = re.search(r"\b([a-zA-Z0-9_\-\s]+\.[a-zA-Z0-9]{2,4})\b", q)
     if match_file:
-        full_name = match_file.group(1)
+        full_name = match_file.group(1).strip()
         base, ext = os.path.splitext(full_name)
         return base, ext.lower(), specific_folder
 
-    # 3. Extension mappings
+    # 4. Extension mappings
     ext_map = {
         "pdf": ".pdf",
         "csv": ".csv",
@@ -643,23 +693,34 @@ def extract_search_target(query: str) -> Tuple[str, Optional[str], Optional[str]
         "docx": ".docx",
         "markdown": ".md",
         "md": ".md",
+        "video": ".mp4",
+        "videos": ".mp4",
+        "audio": ".mp3",
+        "image": ".png",
     }
 
     target_ext = None
     for name, ext in ext_map.items():
-        if f"{name} file" in q_lower or f"{name} files" in q_lower or q_lower.endswith(f" {name}"):
+        if (
+            f"{name} file" in q_lower
+            or f"{name} files" in q_lower
+            or q_lower.endswith(f" {name}")
+            or f" {name} in " in f" {q_lower} "
+            or f" {name} on " in f" {q_lower} "
+        ):
             target_ext = ext
             break
 
-    # Clean query text
+    # 5. Clean query text
     clean_text = re.sub(
-        r"^(?:jarvis\s+|hey\s+jarvis\s+|please\s+)?(?:find|search(?:\s+for)?|where\s+is|locate|open|read|summarize)\s+(?:my\s+|the\s+|file\s+|files\s+)?",
+        r"^(?:jarvis\s+|hey\s+jarvis\s+|please\s+|can\s+you\s+)?(?:find(?:\s+me)?|search(?:\s+for)?|where\s+is|locate|open|read|summarize)\s+(?:my\s+|the\s+|file\s+|files\s+)?",
         "",
         q,
         flags=re.IGNORECASE,
     ).strip()
     
-    clean_text = re.sub(r"\b(?:in|from|under)\s+(?:my\s+)?(?:downloads|documents|desktop|pictures|onedrive)\b", "", clean_text, flags=re.IGNORECASE).strip()
+    clean_text = re.sub(r"\b(?:in|on|from|under)\s+(?:my\s+)?(?:downloads|documents|desktop|pictures|videos|music|onedrive|that\s+folder)\b", "", clean_text, flags=re.IGNORECASE).strip()
+    clean_text = re.sub(r"\b(?:there|in\s+there)\b", "", clean_text, flags=re.IGNORECASE).strip()
     clean_text = re.sub(r"\b(?:files?|pdf|txt|csv|docx?)\b", "", clean_text, flags=re.IGNORECASE).strip()
     clean_text = clean_text.rstrip("?.,").strip()
 
@@ -668,27 +729,64 @@ def extract_search_target(query: str) -> Tuple[str, Optional[str], Optional[str]
 
 def handle_file_search_command(raw_input: str) -> Tuple[bool, str]:
     """
-    Handles natural file search queries and returns nicely formatted results with full paths.
+    Handles natural file search queries with smart context awareness.
     """
     q = raw_input.lower().strip()
-    search_triggers = ["find", "search for", "search my", "where is my", "where is the", "locate"]
-    if not any(q.startswith(trig) or f" {trig} " in f" {q} " for trig in search_triggers):
+
+    # Distinguish from web/youtube search
+    if any(q.startswith(x) or f" {x} " in f" {q} " for x in ["search the web", "search google", "search youtube", "google "]):
         return False, ""
 
-    if any(q.startswith(x) for x in ["search the web", "search google", "search youtube"]):
+    search_triggers = ["find", "search for", "search my", "search", "where is my", "where is the", "where is", "locate"]
+    is_search = False
+    for trig in search_triggers:
+        if q.startswith(trig) or f" {trig} " in f" {q} ":
+            is_search = True
+            break
+
+    if not is_search:
         return False, ""
 
-    target_term, target_ext, specific_folder = extract_search_target(raw_input)
+    # For queries starting with "search":
+    # It's a FILE search ONLY IF it mentions a file/document/location/extension explicitly or via context
+    file_clues = [
+        r"\b(?:in|on|from|under)\s+(?:downloads|documents|desktop|pictures|videos|music|onedrive)\b",
+        r"\b(?:my\s+)?(?:downloads|documents|desktop|pictures|videos|music|onedrive)\b",
+        r"\b(?:file|files|folder|folders|pdf|txt|csv|docx?|xlsx?|py|mp4|mp3|video|videos|assignment|resume|notes|code|script)\b",
+        r"\b(?:there|in\s+there)\b",
+        r"\.[a-zA-Z0-9]{2,4}\b",
+    ]
+    has_file_clue = any(re.search(pat, q) for pat in file_clues)
+    is_explicit_file_verb = any(q.startswith(v) for v in ["find", "where is", "locate"])
+
+    if not has_file_clue and not is_explicit_file_verb:
+        return False, ""
+
+    target_term, target_ext, specific_folder = extract_search_target(raw_input, context)
+
+    if "there" in q and not specific_folder:
+        return True, "Which location or folder did you mean by 'there'?"
+
     if not target_term and not target_ext:
         return True, "What file would you like me to search for?"
 
+    if specific_folder:
+        context.update(last_location=specific_folder)
+
     results = search_user_files(target_term, target_ext, specific_folder, max_results=10)
 
+    context.update(
+        last_intent="FILE_SEARCH",
+        last_search_query=target_term or target_ext,
+        last_found_files=results,
+    )
+
+    loc_desc = f" in {specific_folder}" if specific_folder else ""
     if not results:
         desc = f"'{target_term}'" if target_term else f"{target_ext} files"
-        return True, f"I searched your user folders, but couldn't find any matching files for {desc}."
+        return True, f"I searched your user folders{loc_desc}, but couldn't find any matching files for {desc}."
 
-    result_lines = [f"I found {len(results)} matching file{'s' if len(results) > 1 else ''}:"]
+    result_lines = [f"I found {len(results)} matching file{'s' if len(results) > 1 else ''}{loc_desc}:"]
     for i, path in enumerate(results, 1):
         result_lines.append(f"{i}. {path}")
 
@@ -697,19 +795,23 @@ def handle_file_search_command(raw_input: str) -> Tuple[bool, str]:
 
 def handle_open_found_file(raw_input: str) -> Tuple[bool, str]:
     """
-    Searches for a requested user file and opens it using the default Windows application.
-    Example: 'Find my resume and open it' or 'Open my resume' or 'Open GST_Assignment.pdf'
+    Searches for a requested user file by name or extension and opens it.
+    Example: 'Open resume.pdf' or 'Open GST_Assignment.pdf'
     """
     q = raw_input.lower().strip()
     if not ("open" in q or "launch" in q):
         return False, ""
 
-    if any(f"open {fld}" in q for fld in ["downloads", "documents", "desktop", "pictures", "music", "videos"]):
+    # Don't intercept folders, apps, or websites
+    folder_names = ["downloads", "documents", "desktop", "pictures", "music", "videos", "onedrive"]
+    if any(f"{w} {fld}" in q for fld in folder_names for w in ["open", "launch"]):
         return False, ""
-    if any(f"open {app}" in q for app in ["chrome", "whatsapp", "spotify", "discord", "calculator", "notepad", "code", "vscode", "edge"]):
+    if any(f"{w} {app}" in q for app in SAFE_APP_MAP for w in ["open", "launch"]):
+        return False, ""
+    if any(f"{w} {site}" in q for site in POPULAR_SITES for w in ["open", "launch"]):
         return False, ""
 
-    target_term, target_ext, specific_folder = extract_search_target(raw_input)
+    target_term, target_ext, specific_folder = extract_search_target(raw_input, context)
     if not target_term and not target_ext:
         return False, ""
 
@@ -721,6 +823,7 @@ def handle_open_found_file(raw_input: str) -> Tuple[bool, str]:
     try:
         os.startfile(best_match)
         filename = os.path.basename(best_match)
+        context.update(last_intent="OPEN_FILE", last_opened_file=best_match, last_found_files=results)
         return True, f"Opening {filename} from {os.path.dirname(best_match)}."
     except Exception as e:
         return True, f"Failed to open {os.path.basename(best_match)}: {e}"
@@ -756,7 +859,7 @@ def handle_read_txt_command(raw_input: str) -> Tuple[bool, str]:
     if not is_read or "pdf" in q:
         return False, ""
 
-    target_term, target_ext, specific_folder = extract_search_target(raw_input)
+    target_term, target_ext, specific_folder = extract_search_target(raw_input, context)
     if not target_term and not target_ext:
         return False, ""
 
@@ -775,6 +878,8 @@ def handle_read_txt_command(raw_input: str) -> Tuple[bool, str]:
 
     if ext.lower() not in SAFE_TEXT_EXTENSIONS:
         return True, f"For security reasons, I only read text documents ({', '.join(SAFE_TEXT_EXTENSIONS)}). I never execute binary or script files."
+
+    context.update(last_intent="READ_FILE", last_found_files=[target_path])
 
     success, content = read_text_file(target_path)
     if not success:
@@ -860,7 +965,7 @@ def handle_read_pdf_command(raw_input: str) -> Tuple[bool, str]:
     if not is_read and not ("pdf" in q and "find" not in q):
         return False, ""
 
-    target_term, _, specific_folder = extract_search_target(raw_input)
+    target_term, _, specific_folder = extract_search_target(raw_input, context)
     if not target_term:
         target_term = "pdf"
 
@@ -870,6 +975,7 @@ def handle_read_pdf_command(raw_input: str) -> Tuple[bool, str]:
 
     pdf_path = candidates[0]
     filename = os.path.basename(pdf_path)
+    context.update(last_intent="READ_PDF", last_found_files=[pdf_path])
 
     success, text, page_count = extract_pdf_text(pdf_path)
     if not success:
@@ -992,13 +1098,14 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
     q = query.lower().strip()
 
     for key, app_data in SAFE_APP_MAP.items():
-        pattern = rf"\b(?:open|launch|start)?\s*{re.escape(key)}\b"
+        pattern = rf"\b(?:open|launch|start)\s+(?:the\s+)?{re.escape(key)}\b"
         if re.search(pattern, q):
             name = app_data.get("name", key.title())
 
             if "uri" in app_data:
                 try:
                     os.system(f"start {app_data['uri']}")
+                    context.update(last_intent="OPEN_APP", last_opened_application=name)
                     return True, f"Opening {name}."
                 except Exception:
                     pass
@@ -1007,6 +1114,7 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
             if cmd and shutil.which(cmd):
                 try:
                     subprocess.Popen([cmd], shell=True)
+                    context.update(last_intent="OPEN_APP", last_opened_application=name)
                     return True, f"Opening {name}."
                 except Exception as e:
                     return True, f"Failed to launch {name}: {e}"
@@ -1016,6 +1124,7 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
                     if os.path.exists(path.split(" --")[0]):
                         try:
                             os.startfile(path)
+                            context.update(last_intent="OPEN_APP", last_opened_application=name)
                             return True, f"Opening {name}."
                         except Exception as e:
                             return True, f"Failed to start {name}: {e}"
@@ -1023,6 +1132,7 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
             if cmd:
                 try:
                     os.startfile(cmd)
+                    context.update(last_intent="OPEN_APP", last_opened_application=name)
                     return True, f"Opening {name}."
                 except Exception:
                     pass
@@ -1030,6 +1140,7 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
             if "web" in app_data:
                 try:
                     webbrowser.open(app_data["web"])
+                    context.update(last_intent="OPEN_APP", last_opened_application=name)
                     return True, f"Opening {name} Web in your browser."
                 except Exception:
                     pass
@@ -1056,16 +1167,21 @@ def get_user_directories() -> Dict[str, str]:
 
 
 def handle_open_folder(query: str) -> Tuple[bool, str]:
-    """Opens safe standard user folders in Windows File Explorer."""
+    """Opens safe standard user folders in Windows File Explorer and updates context."""
     folders = get_user_directories()
-    q = query.lower()
+    q = query.lower().strip()
 
     for name, path in folders.items():
-        pattern = rf"\b(?:open|show|explore)\s+(?:my\s+)?{name}(?:\s+folder)?\b"
+        pattern = rf"\b(?:open|show|explore|launch)\s+(?:my\s+)?{name}(?:\s+folder)?\b"
         if re.search(pattern, q):
             if os.path.exists(path):
                 try:
                     os.startfile(path)
+                    context.update(
+                        last_intent="OPEN_FOLDER",
+                        last_location=name.title(),
+                        last_found_files=[],
+                    )
                     return True, f"Opening {name.title()}."
                 except Exception as e:
                     return True, f"Could not open {name.title()}: {e}"
@@ -1369,14 +1485,21 @@ def _safe_eval_ast(node):
 def safe_calculate(expression_str: str) -> Optional[float]:
     """Safely calculates mathematical expressions without using eval()."""
     try:
+        cleaned = expression_str.lower()
+        cleaned = re.sub(r"\bmultiplied\s+by\b", "*", cleaned)
+        cleaned = re.sub(r"\btimes\b", "*", cleaned)
+        cleaned = re.sub(r"\bdivided\s+by\b", "/", cleaned)
+        cleaned = re.sub(r"\bplus\b", "+", cleaned)
+        cleaned = re.sub(r"\bminus\b", "-", cleaned)
+        
         cleaned = re.sub(
             r"(\d+(?:\.\d+)?)\s*(?:percent|%)\s*(?:of)\s*(\d+(?:\.\d+)?)",
             r"((\1 / 100) * \2)",
-            expression_str,
+            cleaned,
             flags=re.IGNORECASE,
         )
-        cleaned = cleaned.replace("x", "*").replace("X", "*").replace("^", "**")
-        sanitized = re.sub(r"[^0-9\+\-\*\/\%\(\)\.\s]", "", cleaned).strip()
+        cleaned = cleaned.replace("x", "*").replace("^", "**")
+        sanitized = re.sub(r"[^0-9\+\-\*/\%\(\)\.\s]", "", cleaned).strip()
         if not sanitized:
             return None
 
@@ -1493,35 +1616,185 @@ def handle_system_status() -> str:
 
 
 # =============================================================================
-# WEB & SCREENSHOT HANDLERS
+# CONTEXTUAL ACTION HANDLERS & WEB HANDLERS
 # =============================================================================
-def handle_open_website(query: str) -> Tuple[bool, str]:
-    """Opens popular websites or custom URLs safely in the default browser."""
-    sites = {
-        "youtube": "https://www.youtube.com",
-        "google": "https://www.google.com",
-        "github": "https://www.github.com",
-        "gmail": "https://mail.google.com",
-        "chatgpt": "https://chatgpt.com",
-        "reddit": "https://www.reddit.com",
-        "stack overflow": "https://stackoverflow.com",
-        "wikipedia": "https://www.wikipedia.org",
-    }
+def handle_contextual_action(raw_input: str) -> Tuple[bool, str]:
+    """
+    Handles context-dependent requests referring to previously found files or results:
+    - 'open it', 'open that', 'open the file', 'open the first one', 'open the second one'
+    - 'show me the largest one', 'largest one'
+    - 'read it', 'read that', 'read the first one'
+    - 'summarize it', 'summarize that'
+    """
+    q = raw_input.lower().strip().rstrip(".,!?")
 
-    for name, url in sites.items():
-        if name in query:
+    # 1. Largest / Size ranking
+    if "largest" in q or "biggest" in q:
+        if not context.last_found_files:
+            return True, "I don't have a list of search results to compare."
+        
+        valid_files = [f for f in context.last_found_files if os.path.isfile(f)]
+        if not valid_files:
+            return True, "The previous search results are no longer available on disk."
+        
+        largest_file = max(valid_files, key=lambda f: os.path.getsize(f))
+        size_bytes = os.path.getsize(largest_file)
+        size_str = f"{round(size_bytes / (1024 * 1024), 2)} MB" if size_bytes >= 1024 * 1024 else f"{round(size_bytes / 1024, 1)} KB"
+        
+        context.update(last_found_files=[largest_file])
+        return True, f"The largest one is {os.path.basename(largest_file)} ({size_str}) located at {largest_file}."
+
+    # 2. 'Open it / that / the first one / the second one'
+    open_pronoun_patterns = [
+        r"^open\s+(?:it|that|this|the\s+file|the\s+one\s+you\s+found|the\s+first\s+one|the\s+second\s+one|the\s+third\s+one|first\s+one|second\s+one)$",
+        r"^launch\s+(?:it|that|this|the\s+file|the\s+first\s+one)$",
+    ]
+    if any(re.match(pat, q) for pat in open_pronoun_patterns) or q in ["open it", "open that", "open this", "open file", "open the file"]:
+        if not context.last_found_files:
+            return True, "I don't have a previously found file in my current context to open."
+        
+        idx = 0
+        if "second" in q:
+            idx = 1 if len(context.last_found_files) > 1 else 0
+        elif "third" in q:
+            idx = 2 if len(context.last_found_files) > 2 else 0
+
+        target_file = context.last_found_files[idx]
+        if not os.path.isfile(target_file):
+            return True, f"I found the reference to {os.path.basename(target_file)}, but it is no longer at that location."
+
+        try:
+            os.startfile(target_file)
+            filename = os.path.basename(target_file)
+            context.update(last_intent="OPEN_FILE", last_opened_file=target_file)
+            return True, f"Opening {filename}."
+        except Exception as e:
+            return True, f"Failed to open {os.path.basename(target_file)}: {e}"
+
+    # 3. 'Read it / that / the first one'
+    read_pronoun_patterns = [
+        r"^(?:read|extract)\s+(?:it|that|this|the\s+file|the\s+first\s+one)$",
+    ]
+    if any(re.match(pat, q) for pat in read_pronoun_patterns) or q in ["read it", "read that", "read this", "read the file"]:
+        if not context.last_found_files:
+            return True, "I don't have a previously found document in my current context to read."
+        
+        target_file = context.last_found_files[0]
+        _, ext = os.path.splitext(target_file)
+        
+        if ext.lower() == ".pdf":
+            success, text, page_count = extract_pdf_text(target_file)
+            if not success:
+                return True, f"Failed to extract PDF: {text}"
+            if not text.strip():
+                return True, f"I found {os.path.basename(target_file)}, but it appears to be scanned or image-based. Text extraction wasn't available for this file."
+            return True, f"I extracted {os.path.basename(target_file)} ({page_count} pages, {len(text):,} characters):\n\n\"{text[:350].strip()}...\""
+
+        elif ext.lower() in SAFE_TEXT_EXTENSIONS:
+            success, content = read_text_file(target_file)
+            if not success:
+                return True, f"Failed to read file: {content}"
+            return True, f"Content of {os.path.basename(target_file)}:\n\n{content.strip()}"
+
+        return True, f"I can only read text documents and PDF files, not {ext} files."
+
+    # 4. 'Summarize it / that / the first one'
+    summarize_pronoun_patterns = [
+        r"^summarize\s+(?:it|that|this|the\s+file|the\s+first\s+one)$",
+        r"^give\s+me\s+a\s+summary\s+of\s+(?:it|that|this)$",
+    ]
+    if any(re.match(pat, q) for pat in summarize_pronoun_patterns) or q in ["summarize it", "summarize that", "summarize this"]:
+        if not context.last_found_files:
+            return True, "I don't have a previously found document in my current context to summarize."
+        
+        target_file = context.last_found_files[0]
+        _, ext = os.path.splitext(target_file)
+        
+        doc_text = ""
+        filename = os.path.basename(target_file)
+        
+        if ext.lower() == ".pdf":
+            success, text, _ = extract_pdf_text(target_file)
+            if not success or not text.strip():
+                return True, f"I could not extract text from {filename} to summarize."
+            doc_text = text
+        elif ext.lower() in SAFE_TEXT_EXTENSIONS:
+            success, content = read_text_file(target_file)
+            if not success or not content.strip():
+                return True, f"I could not read {filename} to summarize."
+            doc_text = content
+        else:
+            return True, f"Cannot summarize {ext} files."
+
+        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if api_key and genai is not None:
+            try:
+                client = genai.Client(api_key=api_key)
+                prompt = f"Provide a concise, clear 2-3 sentence summary of the document '{filename}':\n\n{doc_text[:8000]}"
+                resp = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=250),
+                )
+                if resp and resp.text:
+                    summary = resp.text.replace("**", "").replace("*", "").strip()
+                    return True, f"Here is the summary of {filename}:\n\n{summary}"
+            except Exception as e:
+                return True, f"Could not generate summary: {e}"
+
+        return True, f"Summary preview of {filename}:\n\n\"{doc_text[:350].strip()}...\""
+
+    return False, ""
+
+
+POPULAR_SITES = {
+    "youtube": "https://www.youtube.com",
+    "google": "https://www.google.com",
+    "github": "https://www.github.com",
+    "gmail": "https://mail.google.com",
+    "chatgpt": "https://chatgpt.com",
+    "reddit": "https://www.reddit.com",
+    "stackoverflow": "https://stackoverflow.com",
+    "stack overflow": "https://stackoverflow.com",
+    "wikipedia": "https://www.wikipedia.org",
+    "linkedin": "https://www.linkedin.com",
+    "instagram": "https://www.instagram.com",
+    "facebook": "https://www.facebook.com",
+    "twitter": "https://twitter.com",
+    "netflix": "https://www.netflix.com",
+    "amazon": "https://www.amazon.com",
+}
+
+
+def handle_open_website(query: str) -> Tuple[bool, str]:
+    """
+    Detects and opens websites cleanly.
+    Recognizes:
+    - 'open youtube', 'open youtube.com', 'go to youtube', 'launch youtube.com'
+    - 'open google.com', 'open github', 'open chatgpt'
+    - Custom domain formats like 'open example.com'
+    """
+    q = query.lower().strip()
+    
+    # 1. Match known website names
+    for name, url in POPULAR_SITES.items():
+        pattern = rf"\b(?:open|launch|go\s+to|start|visit|browse)?\s*{re.escape(name)}(?:\.com|\.org|\.io|\.net)?\b"
+        if re.search(pattern, q):
             try:
                 webbrowser.open(url)
+                context.update(last_intent="OPEN_WEBSITE")
                 return True, f"Opening {name.title()}."
             except Exception as e:
                 return True, f"Could not open {name}: {e}"
 
-    match = re.search(r"open\s+([a-zA-Z0-9\-]+\.[a-zA-Z]{2,})", query)
-    if match:
-        domain = match.group(1)
+    # 2. Match generic domain formats like 'open xyz.com', 'visit abc.org'
+    match_domain = re.search(r"\b(?:open|launch|go\s+to|visit)\s+([a-zA-Z0-9\-]+\.[a-zA-Z]{2,6}(?:/[^\s]*)?)\b", q)
+    if match_domain:
+        domain = match_domain.group(1)
         url = f"https://{domain}" if not domain.startswith("http") else domain
         try:
             webbrowser.open(url)
+            context.update(last_intent="OPEN_WEBSITE")
             return True, f"Opening {domain}."
         except Exception as e:
             return True, f"Could not open {domain}: {e}"
@@ -1530,19 +1803,42 @@ def handle_open_website(query: str) -> Tuple[bool, str]:
 
 
 def handle_search_web(query: str) -> Tuple[bool, str]:
-    """Extracts search query and opens Google search in default browser."""
-    patterns = [
-        r"search\s+the\s+web\s+for\s+(.+)",
-        r"search\s+google\s+for\s+(.+)",
-        r"search\s+for\s+(.+)",
-        r"google\s+(.+)",
+    """
+    Handles web search queries and YouTube searches in the default browser.
+    Examples:
+    - 'search YouTube for Week 4 video' -> searches YouTube
+    - 'search the web for Python tutorial' -> searches Google
+    - 'search Python tutorial' -> searches Google
+    - 'google latest tech news' -> searches Google
+    """
+    q = query.strip()
+    q_lower = q.lower()
+
+    # 1. Search YouTube specifically
+    yt_match = re.search(r"search\s+youtube\s+(?:for\s+)?(.+)", q_lower)
+    if yt_match:
+        term = yt_match.group(1).strip().rstrip("?.,!")
+        if term:
+            url = f"https://www.youtube.com/results?search_query={term.replace(' ', '+')}"
+            try:
+                webbrowser.open(url)
+                return True, f"Searching YouTube for {term}."
+            except Exception as e:
+                return True, f"Failed to search YouTube: {e}"
+
+    # 2. Search web / Google
+    web_patterns = [
+        r"search\s+the\s+web\s+(?:for\s+)?(.+)",
+        r"search\s+google\s+(?:for\s+)?(.+)",
+        r"^google\s+(.+)",
+        r"^search\s+for\s+(.+)",
+        r"^search\s+(.+)",
     ]
 
-    for pattern in patterns:
-        match = re.search(pattern, query, re.IGNORECASE)
+    for pattern in web_patterns:
+        match = re.search(pattern, q_lower)
         if match:
-            search_term = match.group(1).strip()
-            search_term = re.sub(r"[\s,\.\!\?]+$", "", search_term)
+            search_term = match.group(1).strip().rstrip("?.,!")
             if search_term:
                 url = f"https://www.google.com/search?q={search_term.replace(' ', '+')}"
                 try:
@@ -1577,7 +1873,7 @@ def handle_screenshot() -> str:
 
 
 # =============================================================================
-# FEATURE 11: COMMAND PRIORITY ROUTER
+# FEATURE 11: SMART CONTEXT COMMAND PRIORITY ROUTER
 # =============================================================================
 def strip_wake_word(text: str) -> str:
     """Cleans and removes wake words ('Jarvis', 'Hey Jarvis') from text."""
@@ -1612,25 +1908,28 @@ def is_exit_command(text: str) -> bool:
 
 def route_command(raw_input: str) -> Tuple[str, bool]:
     """
-    Main V2.1 command priority routing pipeline:
-    1. Normalize text & strip wake word
-    2. Check pending confirmation state
-    3. Check exit / offline commands
-    4. Check help & system status commands
-    5. Check screen vision
-    6. Check volume control
-    7. Check local commands (time, date, CPU, RAM, OS, screenshot)
-    8. Check memory commands (remember, recall, forget, clear)
-    9. Check PDF reading & summarization (via pypdf)
-    10. Check TXT / text file reading & summarization
-    11. Check open found file
-    12. Check user file search
-    13. Check folder control (Downloads, Documents, Desktop, etc.)
-    14. Check web search & website opening
-    15. Check application control (Chrome, WhatsApp, VS Code, Spotify, etc.)
-    16. Check safe mathematical calculator
-    17. Fallback to Gemini AI Brain with rolling session history and personal memory context
-    Returns (response_text, should_exit)
+    Main V2.1 Smart Context Priority Routing Pipeline:
+    1. Check pending confirmation state
+    2. Check exit / offline commands
+    3. Conversational Greetings
+    4. Help & Status Commands
+    5. Screen Vision
+    6. Volume Control
+    7. Time & Date
+    8. System Diagnostics (CPU, RAM, OS)
+    9. Screenshot
+    10. Memory Commands (remember, recall, forget, clear)
+    11. Contextual Action on previous result ('open it', 'read it', 'summarize it', 'largest one')
+    12. Explicit Website Opening ('open youtube', 'open youtube.com', 'open github', etc.)
+    13. Explicit Folder Opening ('open downloads', 'open desktop', 'open documents', etc.)
+    14. Explicit Application Opening ('open vs code', 'open chrome', 'open spotify', etc.)
+    15. PDF Reading & Extraction ('read GST assignment PDF', 'summarize GST assignment')
+    16. TXT / Text Document Reading ('read notes.txt', 'summarize notes.txt')
+    17. Open Specific File by Name ('open resume.pdf', 'open notes.txt')
+    18. File Search across user folders ('find my resume on Desktop', 'search Week 4 video in Downloads', 'search Week 4 video there')
+    19. Web Search ('search Python tutorial', 'search the web for ...', 'search YouTube for ...')
+    20. Safe Mathematical Calculator ('what is 50 times 20', 'what is 25 multiplied by 40')
+    21. Fallback to Gemini AI Brain with clean prompt and saved memory context
     """
     global PENDING_CONFIRMATION
 
@@ -1679,10 +1978,10 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
         return vol_resp, False
 
     # 7. Time and Date
-    if "time" in prompt_lower and any(w in prompt_lower for w in ["what", "tell", "current"]):
+    if re.search(r"\btime\b", prompt_lower) and not re.search(r"\b\d+\s+times\b|\btimes\s+\d+\b", prompt_lower) and any(w in prompt_lower for w in ["what", "tell", "current"]):
         return handle_time(), False
 
-    if ("date" in prompt_lower or "today" in prompt_lower) and any(w in prompt_lower for w in ["what", "tell", "current"]):
+    if re.search(r"\b(?:date|today)\b", prompt_lower) and any(w in prompt_lower for w in ["what", "tell", "current"]):
         return handle_date(), False
 
     # 8. System Diagnostics (CPU, RAM, OS)
@@ -1719,51 +2018,62 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
     if mem_resp:
         return mem_resp, False
 
-    # 11. PDF Reading & Extraction (via pypdf) - if PDF or pdf mentioned
+    # 11. Contextual Actions on previous result ('open it', 'read it', 'summarize it', 'largest one')
+    handled_ctx, ctx_resp = handle_contextual_action(prompt)
+    if handled_ctx:
+        return ctx_resp, False
+
+    # 12. Explicit Website Opening ('open youtube', 'open youtube.com', 'open github', etc.)
+    handled_web, web_resp = handle_open_website(prompt_lower)
+    if handled_web:
+        return web_resp, False
+
+    # 13. Explicit Folder Opening ('open downloads', 'open desktop', 'open documents', etc.)
+    handled_folder, folder_resp = handle_open_folder(prompt_lower)
+    if handled_folder:
+        return folder_resp, False
+
+    # 14. Explicit Application Opening ('open vs code', 'open chrome', 'open spotify', etc.)
+    handled_app, app_resp = handle_open_app(prompt_lower)
+    if handled_app:
+        return app_resp, False
+
+    # 15. PDF Reading & Extraction ('read GST assignment PDF', 'summarize GST assignment')
     if "pdf" in prompt_lower or ".pdf" in prompt_lower:
         handled_pdf, pdf_resp = handle_read_pdf_command(prompt)
         if handled_pdf:
             return pdf_resp, False
 
-    # 12. TXT / Text File Reading
+    # 16. TXT / Text Document Reading ('read notes.txt', 'summarize notes.txt')
     handled_read, read_resp = handle_read_txt_command(prompt)
     if handled_read:
         return read_resp, False
 
-    # 13. Open Found File
+    # 17. Open Specific File by Name ('open resume.pdf', 'open notes.txt')
     handled_open_file, open_file_resp = handle_open_found_file(prompt)
     if handled_open_file:
         return open_file_resp, False
 
-    # 14. File Search across user folders
+    # 18. File Search across user folders ('find my resume on Desktop', 'search Week 4 video in Downloads', 'search Week 4 video there')
     handled_file_search, search_file_resp = handle_file_search_command(prompt)
     if handled_file_search:
         return search_file_resp, False
 
-    # 15. Folder Control
-    if "open" in prompt_lower or "launch" in prompt_lower or "explore" in prompt_lower:
-        handled_folder, folder_resp = handle_open_folder(prompt_lower)
-        if handled_folder:
-            return folder_resp, False
-
-    # 16. Web Search
+    # 19. Web Search ('search Python tutorial', 'search the web for ...', 'search YouTube for ...')
     handled_search, search_resp = handle_search_web(prompt)
     if handled_search:
         return search_resp, False
 
-    # 17. Open Websites
-    if "open" in prompt_lower or "launch" in prompt_lower or "start" in prompt_lower:
-        handled_web, web_resp = handle_open_website(prompt_lower)
-        if handled_web:
-            return web_resp, False
-
-        # 18. Open Applications
-        handled_app, app_resp = handle_open_app(prompt_lower)
-        if handled_app:
-            return app_resp, False
-
-    # 19. Safe Calculator
-    if "calculate" in prompt_lower or "percent of" in prompt_lower or re.search(r"what is \d+", prompt_lower):
+    # 20. Safe Mathematical Calculator ('what is 50 times 20', 'what is 25 multiplied by 40')
+    if (
+        "calculate" in prompt_lower
+        or "percent of" in prompt_lower
+        or "times" in prompt_lower
+        or "multiplied by" in prompt_lower
+        or "divided by" in prompt_lower
+        or re.search(r"what is \d+", prompt_lower)
+        or re.search(r"^\d+\s*[\+\-\*/\%]\s*\d+", prompt_lower)
+    ):
         math_candidate = re.sub(r"^(calculate|what is|how much is)\s*", "", prompt_lower, flags=re.IGNORECASE)
         math_candidate = math_candidate.rstrip("?.").strip()
         result = safe_calculate(math_candidate)
@@ -1772,7 +2082,7 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
                 result = int(result)
             return f"The result is {result}.", False
 
-    # 20. Fallback to Gemini AI Brain
+    # 21. Fallback to Gemini AI Brain
     ai_response = ask_ai(prompt)
     return ai_response, False
 
