@@ -6,3 +6,4 @@ Pillow>=10.0.0
 python-dotenv>=1.0.0
 sounddevice>=0.5.0
 numpy>=1.20.0
+pypdf>=4.0.0

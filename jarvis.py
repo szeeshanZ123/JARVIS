@@ -1,11 +1,11 @@
 """
 =============================================================================
-J.A.R.V.I.S - Personal AI Desktop Voice Assistant (V2)
+J.A.R.V.I.S - Personal AI Desktop Voice Assistant (V2.1)
 =============================================================================
 An intelligent, lightweight, and reliable personal desktop AI assistant
 for Windows powered by Google Gemini AI with persistent memory, safe application
-& folder launching, volume controls, file search, text file reading, screen vision,
-system monitoring, and natural voice interaction.
+& folder launching, volume controls, recursive user file search, text file reading,
+PDF extraction (via pypdf), screen vision, system monitoring, and natural voice.
 
 Setup:
 1. pip install -r requirements.txt
@@ -101,6 +101,12 @@ try:
 except ImportError:
     sd = None
     np = None
+
+# PDF text extraction
+try:
+    import pypdf
+except ImportError:
+    pypdf = None
 
 # Gemini SDK
 try:
@@ -209,7 +215,7 @@ def speak(text: str) -> None:
 
 
 # =============================================================================
-# FEATURE 1: PERSONAL PERSISTENT MEMORY SYSTEM (JSON)
+# SYSTEM 1: REAL PERSISTENT MEMORY SYSTEM (jarvis_memory.json)
 # =============================================================================
 MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_memory.json")
 
@@ -217,25 +223,45 @@ MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis_m
 def load_memory() -> Dict[str, Any]:
     """
     Safely loads memory from jarvis_memory.json.
-    Automatically recreates the structure if corrupted or missing.
-    """
-    default_structure = {
-        "facts": {},
-        "statements": [],
-        "updated_at": datetime.datetime.now().isoformat(),
+    Automatically creates/recreates the structure if corrupted or missing.
+    Format:
+    {
+      "memories": [
+        {"id": 1, "text": "My favorite language is Python", "created_at": "..."}
+      ]
     }
+    """
+    default_structure: Dict[str, Any] = {"memories": []}
 
     if not os.path.isfile(MEMORY_FILE):
+        try:
+            with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(default_structure, f, indent=2)
+        except Exception:
+            pass
         return default_structure
 
     try:
         with open(MEMORY_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            if isinstance(data, dict) and "facts" in data and "statements" in data:
+            if isinstance(data, dict) and "memories" in data and isinstance(data["memories"], list):
                 return data
+            # Migrate from older format if encountered
+            if isinstance(data, dict) and "statements" in data:
+                new_memories = []
+                for i, st in enumerate(data.get("statements", []), 1):
+                    new_memories.append({
+                        "id": i,
+                        "text": st,
+                        "created_at": datetime.datetime.now().isoformat(),
+                    })
+                migrated = {"memories": new_memories}
+                save_memory(migrated)
+                return migrated
     except Exception:
         pass
 
+    # Corrupted file recovery
     try:
         with open(MEMORY_FILE, "w", encoding="utf-8") as f:
             json.dump(default_structure, f, indent=2)
@@ -246,9 +272,8 @@ def load_memory() -> Dict[str, Any]:
 
 
 def save_memory(data: Dict[str, Any]) -> bool:
-    """Safely saves memory dictionary to jarvis_memory.json."""
+    """Safely writes memory dictionary to jarvis_memory.json on disk."""
     try:
-        data["updated_at"] = datetime.datetime.now().isoformat()
         with open(MEMORY_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         return True
@@ -256,21 +281,26 @@ def save_memory(data: Dict[str, Any]) -> bool:
         return False
 
 
-def handle_remember(text: str) -> str:
+def get_memory_count() -> int:
+    """Returns the total number of stored persistent memories."""
+    mem_data = load_memory()
+    return len(mem_data.get("memories", []))
+
+
+def handle_remember(raw_text: str) -> str:
     """
-    Stores an explicit personal fact into memory.
-    Handles various natural voice inputs:
-    - 'remember that my name is Zeeshan'
-    - 'remember my name is Zeeshan'
-    - 'remember my name my name is Zeeshan'
-    - 'remember that I am working on a data science project'
-    - 'remember that my favorite programming language is Python'
+    Extracts and stores an explicit personal memory into jarvis_memory.json on disk.
+    Examples:
+    - 'Remember that my favorite language is Python.'
+    - 'Remember that my main project is Vision Lens.'
+    - 'Remember my favorite color is blue.'
+    - 'Remember that I live in New York.'
     """
-    # Clean leading command triggers
+    # Clean leading trigger phrases
     fact_text = re.sub(
-        r"^(?:please\s+|can\s+you\s+)?(?:remember\s+that|remember|save\s+in\s+memory(?:\s+that)?)\s+",
+        r"^(?:please\s+|can\s+you\s+)?(?:remember\s+that|remember|save\s+in\s+memory(?:\s+that)?|save\s+to\s+memory(?:\s+that)?)\s+",
         "",
-        text,
+        raw_text,
         flags=re.IGNORECASE,
     ).strip()
     fact_text = fact_text.rstrip(".").strip()
@@ -278,125 +308,139 @@ def handle_remember(text: str) -> str:
     if not fact_text:
         return "What would you like me to remember?"
 
-    mem = load_memory()
-    if "facts" not in mem:
-        mem["facts"] = {}
-    if "statements" not in mem:
-        mem["statements"] = []
+    mem_data = load_memory()
+    memories = mem_data.get("memories", [])
 
-    # 1. Name: "my name is X" / "my name my name is X" / "i am X"
-    name_match = re.search(r"(?:my name is|my name my name is|i am)\s+([A-Za-z\s]+)", fact_text, re.IGNORECASE)
-    if name_match and "working" not in fact_text.lower():
-        extracted_name = name_match.group(1).strip().title()
-        # Clean trailing filler words
-        extracted_name = re.sub(r"\b(please|thanks|thank you)\b", "", extracted_name, flags=re.IGNORECASE).strip()
-        if extracted_name:
-            mem["facts"]["name"] = extracted_name
+    # Check for duplicate
+    for m in memories:
+        if m.get("text", "").lower() == fact_text.lower():
+            return "I already have that saved in my memory."
 
-    # 2. Project: "i am working on X" / "my project is X"
-    proj_match = re.search(r"(?:i am working on|my project is|working on)\s+(?:a|an|the)?\s*([^,\.]+)", fact_text, re.IGNORECASE)
-    if proj_match:
-        mem["facts"]["project"] = proj_match.group(1).strip()
+    # Compute next ID
+    next_id = 1
+    if memories:
+        existing_ids = [m.get("id", 0) for m in memories if isinstance(m.get("id"), int)]
+        next_id = max(existing_ids) + 1 if existing_ids else len(memories) + 1
 
-    # 3. Favorite [thing] is [value] / Favorite language is Python
-    fav_match = re.search(r"my favorite\s+([a-zA-Z\s]+?)\s+is\s+([^,\.]+)", fact_text, re.IGNORECASE)
-    if fav_match:
-        key = f"favorite_{fav_match.group(1).strip().lower()}"
-        mem["facts"][key] = fav_match.group(2).strip()
+    new_entry = {
+        "id": next_id,
+        "text": fact_text,
+        "created_at": datetime.datetime.now().isoformat(),
+    }
+    memories.append(new_entry)
+    mem_data["memories"] = memories
 
-    # Store statement if not duplicate
-    clean_statement = fact_text
-    if clean_statement not in mem["statements"]:
-        mem["statements"].append(clean_statement)
-
-    save_memory(mem)
-    return "I'll remember that."
+    if save_memory(mem_data):
+        return "I've saved that to my memory."
+    return "I couldn't write to memory storage at the moment."
 
 
-def handle_memory_query(text: str) -> Optional[str]:
-    """Retrieves information from personal memory."""
-    t = text.lower().strip().rstrip("?.,!")
-    mem = load_memory()
-    facts = mem.get("facts", {})
-    statements = mem.get("statements", [])
+def handle_memory_query(query: str) -> Optional[str]:
+    """
+    Retrieves stored memories from jarvis_memory.json.
+    Supports general recall ('What do you remember about me?') and targeted questions
+    ('What is my favorite language?', 'What is my main project?').
+    """
+    t = query.lower().strip().rstrip("?.,!")
+    mem_data = load_memory()
+    memories = mem_data.get("memories", [])
 
-    # 1. "What do you remember about me?" / "What is in your memory?"
-    if any(q in t for q in [
-        "what do you remember about me", "what do you remember", "what is in your memory",
-        "show my memory", "show memories", "list my memories", "list memories", "tell me what you remember"
-    ]):
-        if not statements and not facts:
+    # 1. General memory recall
+    general_recall_triggers = [
+        "what do you remember about me",
+        "what do you remember",
+        "what is in your memory",
+        "what's in your memory",
+        "show my memory",
+        "show memories",
+        "list my memories",
+        "list memories",
+        "tell me what you remember",
+        "check your memory",
+    ]
+    if any(q == t or q in t for q in general_recall_triggers):
+        if not memories:
             return "I don't have any stored memories about you yet. You can tell me by saying 'Remember that...'."
         
-        items = []
-        if "name" in facts:
-            items.append(f"Your name is {facts['name']}.")
-        if "project" in facts:
-            items.append(f"You are working on {facts['project']}.")
-        for k, v in facts.items():
-            if k.startswith("favorite_"):
-                subj = k.replace("favorite_", "")
-                items.append(f"Your favorite {subj} is {v}.")
-        for st in statements:
-            formatted = f"You mentioned: {st}."
-            if not any(facts.get(k, "") in st for k in ["name", "project"]):
-                items.append(formatted)
+        mem_lines = [f"• {m['text']}" for m in memories]
+        return "Here is what I have saved in my memory:\n" + "\n".join(mem_lines)
 
-        return "Here is what I remember about you: " + " ".join(items)
+    # 2. Targeted memory retrieval questions
+    if not memories:
+        return None
 
-    # 2. Name questions
-    if any(q in t for q in ["what is my name", "what's my name", "who am i", "do you know my name", "tell me my name"]):
-        if "name" in facts:
-            return f"Your name is {facts['name']}."
-        for st in statements:
-            if "name is" in st.lower():
-                return f"According to my memory, {st}."
+    # Fast direct substring/keyword matching on stored memory texts
+    keywords = [w for w in re.findall(r"\b\w+\b", t) if w not in ["what", "is", "my", "the", "a", "an", "do", "you", "know", "tell", "me", "about", "which"]]
+    
+    # Try direct keyword matching
+    for m in memories:
+        m_text = m.get("text", "")
+        m_text_lower = m_text.lower()
+        
+        # Exact keyword overlap check
+        if all(kw in m_text_lower for kw in keywords if len(kw) > 2) and len(keywords) >= 2:
+            return f"According to my memory, {m_text}."
 
-    # 3. Project questions
-    if any(q in t for q in ["what project", "which project", "project am i working on", "what am i working on"]):
-        if "project" in facts:
-            return f"You are working on {facts['project']}."
-        for st in statements:
-            if "working on" in st.lower() or "project" in st.lower():
-                return f"You are {st}."
-
-    # 4. Favorite questions
-    if "favorite" in t:
-        fav_match = re.search(r"(?:what is|what's|tell me)\s+my favorite\s+([a-zA-Z\s]+)", t)
-        if fav_match:
-            subj = fav_match.group(1).strip().lower()
-            key = f"favorite_{subj}"
-            if key in facts:
-                return f"Your favorite {subj} is {facts[key]}."
-            for k, v in facts.items():
-                if subj in k or k.replace("favorite_", "") in subj:
-                    return f"Your favorite {k.replace('favorite_', '')} is {v}."
+    # If Gemini is available, query Gemini using local JSON memory as source of truth
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if api_key and genai is not None:
+        try:
+            memories_formatted = "\n".join([f"- {m['text']}" for m in memories])
+            prompt = (
+                f"You are JARVIS. Answer the user's question strictly using ONLY the following saved personal memories:\n"
+                f"{memories_formatted}\n\n"
+                f"User Question: {query}\n\n"
+                f"If the answer is found in the memories, provide a direct, concise, natural 1-sentence answer suitable for speech output. "
+                f"If the answer is NOT mentioned anywhere in the memories, reply with exactly: 'MEMORY_NOT_FOUND'."
+            )
+            client = genai.Client(api_key=api_key)
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.2, max_output_tokens=100),
+            )
+            if resp and resp.text:
+                cleaned = resp.text.replace("**", "").replace("*", "").strip()
+                if "MEMORY_NOT_FOUND" not in cleaned:
+                    return cleaned
+        except Exception:
+            pass
 
     return None
 
 
-def handle_forget(text: str) -> str:
-    """Removes a specific memory fact."""
-    t = re.sub(r"^(?:please\s+)?(?:forget\s+that|forget|delete\s+memory(?:\s+of)?)\s+", "", text, flags=re.IGNORECASE).strip().rstrip(".").lower()
-    mem = load_memory()
-    removed = False
+def handle_forget(raw_text: str) -> str:
+    """
+    Removes a matching memory entry from jarvis_memory.json.
+    Example: 'Forget that my favorite language is Python.'
+    """
+    target = re.sub(
+        r"^(?:please\s+|can\s+you\s+)?(?:forget\s+that|forget|delete\s+memory(?:\s+of)?|remove\s+memory(?:\s+of)?)\s+",
+        "",
+        raw_text,
+        flags=re.IGNORECASE,
+    ).strip().rstrip(".").lower()
 
-    for k in list(mem.get("facts", {}).keys()):
-        if k in t or mem["facts"][k].lower() in t:
-            del mem["facts"][k]
-            removed = True
+    if not target:
+        return "What memory would you like me to forget?"
 
-    new_statements = []
-    for st in mem.get("statements", []):
-        if t in st.lower() or any(w in st.lower() for w in t.split() if len(w) > 3):
-            removed = True
-        else:
-            new_statements.append(st)
-    mem["statements"] = new_statements
+    mem_data = load_memory()
+    memories = mem_data.get("memories", [])
+    initial_count = len(memories)
 
-    if removed:
-        save_memory(mem)
-        return "I have removed that from my memory."
+    # Filter out matching items
+    new_memories = []
+    for m in memories:
+        m_text_lower = m.get("text", "").lower()
+        if target in m_text_lower or m_text_lower in target:
+            continue
+        new_memories.append(m)
+
+    if len(new_memories) < initial_count:
+        mem_data["memories"] = new_memories
+        save_memory(mem_data)
+        return "I've removed that from my memory."
+
     return "I couldn't find a matching memory to remove."
 
 
@@ -421,11 +465,7 @@ def check_confirmation(raw_input: str) -> Optional[Tuple[str, bool]]:
     if cleaned in ["yes", "y", "confirm", "sure", "proceed", "do it", "yeah", "yep", "ok", "okay"]:
         PENDING_CONFIRMATION = None
         if action == "clear_memory":
-            default_mem = {
-                "facts": {},
-                "statements": [],
-                "updated_at": datetime.datetime.now().isoformat(),
-            }
+            default_mem: Dict[str, Any] = {"memories": []}
             save_memory(default_mem)
             return "All stored memories have been permanently cleared.", False
         return "Action confirmed and executed.", False
@@ -435,6 +475,434 @@ def check_confirmation(raw_input: str) -> Optional[Tuple[str, bool]]:
         return "Operation cancelled. Your data remains unchanged.", False
 
     return "Please confirm with 'yes' to proceed or 'no' to cancel.", False
+
+
+# =============================================================================
+# SYSTEM 2: COMPREHENSIVE WINDOWS USER FILE SEARCH & LAUNCHER
+# =============================================================================
+def get_user_search_roots() -> List[str]:
+    """
+    Dynamically discovers all accessible user folders on Windows.
+    Desktop, Documents, Downloads, Pictures, Videos, Music, and OneDrive (if present).
+    Never hardcodes usernames.
+    """
+    user_home = os.environ.get("USERPROFILE", os.path.expanduser("~"))
+    standard_folders = ["Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music"]
+    roots = []
+
+    # Current working directory first for instant project files match
+    cwd = os.getcwd()
+    roots.append(cwd)
+
+    for folder in standard_folders:
+        path = os.path.join(user_home, folder)
+        if os.path.isdir(path) and path not in roots:
+            roots.append(path)
+
+    # Check OneDrive
+    onedrive_path = os.environ.get("OneDrive", os.path.join(user_home, "OneDrive"))
+    if os.path.isdir(onedrive_path) and onedrive_path not in roots:
+        roots.append(onedrive_path)
+        for folder in ["Desktop", "Documents", "Pictures"]:
+            sub = os.path.join(onedrive_path, folder)
+            if os.path.isdir(sub) and sub not in roots:
+                roots.append(sub)
+
+    return roots
+
+
+def search_user_files(
+    query_term: str,
+    target_ext: Optional[str] = None,
+    specific_folder: Optional[str] = None,
+    max_results: int = 10,
+) -> List[str]:
+    """
+    Performs a fast, case-insensitive, recursive search across user folders.
+    Skips system/hidden/temp folders.
+    """
+    search_roots = get_user_search_roots()
+    if specific_folder:
+        search_roots = [r for r in search_roots if specific_folder.lower() in r.lower()]
+        if not search_roots:
+            search_roots = get_user_search_roots()
+
+    matched_files: List[Tuple[int, str]] = []  # (score, path)
+    scanned_count = 0
+    max_scan = 1500
+    cleaned_query = query_term.lower().strip()
+    query_words = [
+        w for w in re.findall(r"\b[a-zA-Z0-9_\-]+\b", cleaned_query)
+        if w not in ["my", "the", "file", "files", "pdf", "txt", "csv", "doc", "docx"]
+    ]
+
+    for root_dir in search_roots:
+        if not os.path.exists(root_dir):
+            continue
+        try:
+            for root, dirs, files in os.walk(root_dir):
+                # Skip hidden/system directories
+                dirs[:] = [
+                    d for d in dirs
+                    if not d.startswith(".") and d.lower() not in ["appdata", "node_modules", ".git", "venv", ".venv", "__pycache__", "$recycle.bin"]
+                ]
+                
+                # Bounded search depth (max 4 levels below root)
+                rel_path = os.path.relpath(root, root_dir)
+                depth = len(rel_path.split(os.sep)) if rel_path != "." else 0
+                if depth > 4:
+                    dirs[:] = []
+                    continue
+
+                for f in files:
+                    scanned_count += 1
+                    if scanned_count > max_scan:
+                        break
+
+                    f_lower = f.lower()
+                    
+                    # Extension check
+                    if target_ext:
+                        if not f_lower.endswith(target_ext.lower()):
+                            continue
+
+                    # Keyword match check
+                    if query_words:
+                        if all(kw in f_lower for kw in query_words):
+                            base_no_ext, _ = os.path.splitext(f_lower)
+                            if base_no_ext == cleaned_query or f_lower == cleaned_query:
+                                score = 4
+                            elif f_lower.startswith(cleaned_query):
+                                score = 3
+                            else:
+                                score = 2
+                            matched_files.append((score, os.path.join(root, f)))
+                    elif target_ext:
+                        matched_files.append((1, os.path.join(root, f)))
+
+                if scanned_count > max_scan or len(matched_files) >= max_results * 2:
+                    break
+        except Exception:
+            continue
+
+    # Deduplicate and sort by score & recency
+    seen = set()
+    unique_matches = []
+    matched_files.sort(key=lambda x: x[0], reverse=True)
+
+    for _, path in matched_files:
+        norm = os.path.normcase(os.path.abspath(path))
+        if norm not in seen and os.path.isfile(path):
+            seen.add(norm)
+            unique_matches.append(path)
+            if len(unique_matches) >= max_results:
+                break
+
+    return unique_matches
+
+
+def extract_search_target(query: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Extracts search term, target extension, and specific folder from natural phrasing.
+    Examples:
+    - 'Find my resume' -> ('resume', None, None)
+    - 'Find resume.pdf' -> ('resume', '.pdf', None)
+    - 'Find CSV files' -> ('', '.csv', None)
+    - 'Search my Downloads for GST assignment' -> ('GST assignment', None, 'Downloads')
+    - 'Find my GST assignment PDF' -> ('GST assignment', '.pdf', None)
+    """
+    q = query.strip()
+    q_lower = q.lower()
+    
+    # 1. Check for specific folder
+    specific_folder = None
+    for fld in ["downloads", "documents", "desktop", "pictures", "videos", "music", "onedrive"]:
+        if f"in {fld}" in q_lower or f"my {fld}" in q_lower or f"from {fld}" in q_lower:
+            specific_folder = fld
+            break
+
+    # 2. Check for explicit file with extension like 'test_notes.txt', 'GST_Assignment.pdf'
+    match_file = re.search(r"\b([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]{2,4})\b", q)
+    if match_file:
+        full_name = match_file.group(1)
+        base, ext = os.path.splitext(full_name)
+        return base, ext.lower(), specific_folder
+
+    # 3. Extension mappings
+    ext_map = {
+        "pdf": ".pdf",
+        "csv": ".csv",
+        "python": ".py",
+        "py": ".py",
+        "text": ".txt",
+        "txt": ".txt",
+        "json": ".json",
+        "excel": ".xlsx",
+        "word": ".docx",
+        "doc": ".docx",
+        "docx": ".docx",
+        "markdown": ".md",
+        "md": ".md",
+    }
+
+    target_ext = None
+    for name, ext in ext_map.items():
+        if f"{name} file" in q_lower or f"{name} files" in q_lower or q_lower.endswith(f" {name}"):
+            target_ext = ext
+            break
+
+    # Clean query text
+    clean_text = re.sub(
+        r"^(?:jarvis\s+|hey\s+jarvis\s+|please\s+)?(?:find|search(?:\s+for)?|where\s+is|locate|open|read|summarize)\s+(?:my\s+|the\s+|file\s+|files\s+)?",
+        "",
+        q,
+        flags=re.IGNORECASE,
+    ).strip()
+    
+    clean_text = re.sub(r"\b(?:in|from|under)\s+(?:my\s+)?(?:downloads|documents|desktop|pictures|onedrive)\b", "", clean_text, flags=re.IGNORECASE).strip()
+    clean_text = re.sub(r"\b(?:files?|pdf|txt|csv|docx?)\b", "", clean_text, flags=re.IGNORECASE).strip()
+    clean_text = clean_text.rstrip("?.,").strip()
+
+    return clean_text, target_ext, specific_folder
+
+
+def handle_file_search_command(raw_input: str) -> Tuple[bool, str]:
+    """
+    Handles natural file search queries and returns nicely formatted results with full paths.
+    """
+    q = raw_input.lower().strip()
+    search_triggers = ["find", "search for", "search my", "where is my", "where is the", "locate"]
+    if not any(q.startswith(trig) or f" {trig} " in f" {q} " for trig in search_triggers):
+        return False, ""
+
+    if any(q.startswith(x) for x in ["search the web", "search google", "search youtube"]):
+        return False, ""
+
+    target_term, target_ext, specific_folder = extract_search_target(raw_input)
+    if not target_term and not target_ext:
+        return True, "What file would you like me to search for?"
+
+    results = search_user_files(target_term, target_ext, specific_folder, max_results=10)
+
+    if not results:
+        desc = f"'{target_term}'" if target_term else f"{target_ext} files"
+        return True, f"I searched your user folders, but couldn't find any matching files for {desc}."
+
+    result_lines = [f"I found {len(results)} matching file{'s' if len(results) > 1 else ''}:"]
+    for i, path in enumerate(results, 1):
+        result_lines.append(f"{i}. {path}")
+
+    return True, "\n".join(result_lines)
+
+
+def handle_open_found_file(raw_input: str) -> Tuple[bool, str]:
+    """
+    Searches for a requested user file and opens it using the default Windows application.
+    Example: 'Find my resume and open it' or 'Open my resume' or 'Open GST_Assignment.pdf'
+    """
+    q = raw_input.lower().strip()
+    if not ("open" in q or "launch" in q):
+        return False, ""
+
+    if any(f"open {fld}" in q for fld in ["downloads", "documents", "desktop", "pictures", "music", "videos"]):
+        return False, ""
+    if any(f"open {app}" in q for app in ["chrome", "whatsapp", "spotify", "discord", "calculator", "notepad", "code", "vscode", "edge"]):
+        return False, ""
+
+    target_term, target_ext, specific_folder = extract_search_target(raw_input)
+    if not target_term and not target_ext:
+        return False, ""
+
+    results = search_user_files(target_term, target_ext, specific_folder, max_results=5)
+    if not results:
+        return True, f"I couldn't find '{target_term or target_ext}' in your user folders to open."
+
+    best_match = results[0]
+    try:
+        os.startfile(best_match)
+        filename = os.path.basename(best_match)
+        return True, f"Opening {filename} from {os.path.dirname(best_match)}."
+    except Exception as e:
+        return True, f"Failed to open {os.path.basename(best_match)}: {e}"
+
+
+# =============================================================================
+# SYSTEM 3: TXT & TEXT FILE READING AND SUMMARIZATION
+# =============================================================================
+SAFE_TEXT_EXTENSIONS = [".txt", ".csv", ".md", ".json", ".log", ".ini", ".env", ".xml", ".yaml", ".yml", ".py"]
+
+
+def read_text_file(file_path: str, max_chars: int = 10000) -> Tuple[bool, str]:
+    """
+    Safely reads text from a text-based file on disk. Never executes code.
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read(max_chars)
+        return True, content
+    except Exception as e:
+        return False, str(e)
+
+
+def handle_read_txt_command(raw_input: str) -> Tuple[bool, str]:
+    """
+    Handles reading and summarizing text files.
+    Example: 'Read my notes.txt' or 'Summarize my notes.txt' or 'Read requirements.txt'
+    """
+    q = raw_input.lower().strip()
+    is_summarize = "summarize" in q or "summary" in q or "explain" in q
+    is_read = "read" in q or is_summarize
+
+    if not is_read or "pdf" in q:
+        return False, ""
+
+    target_term, target_ext, specific_folder = extract_search_target(raw_input)
+    if not target_term and not target_ext:
+        return False, ""
+
+    # Look for matching text files
+    candidates = search_user_files(target_term, target_ext or ".txt", specific_folder, max_results=3)
+    if not candidates and not target_ext:
+        candidates = search_user_files(target_term, None, specific_folder, max_results=3)
+        candidates = [c for c in candidates if os.path.splitext(c)[1].lower() in SAFE_TEXT_EXTENSIONS]
+
+    if not candidates:
+        return True, f"I couldn't find the text file '{target_term}' in your project or user folders."
+
+    target_path = candidates[0]
+    filename = os.path.basename(target_path)
+    _, ext = os.path.splitext(target_path)
+
+    if ext.lower() not in SAFE_TEXT_EXTENSIONS:
+        return True, f"For security reasons, I only read text documents ({', '.join(SAFE_TEXT_EXTENSIONS)}). I never execute binary or script files."
+
+    success, content = read_text_file(target_path)
+    if not success:
+        return True, f"Could not read {filename}: {content}"
+
+    if not content.strip():
+        return True, f"The file '{filename}' is currently empty."
+
+    char_count = len(content)
+
+    # Automatic summarization if requested or if long
+    if is_summarize or char_count > 400:
+        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        if api_key and genai is not None:
+            try:
+                client = genai.Client(api_key=api_key)
+                prompt = (
+                    f"Provide a concise, professional 2-3 sentence summary of the following document '{filename}' "
+                    f"suitable for speech synthesis:\n\n{content[:6000]}"
+                )
+                resp = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=250),
+                )
+                if resp and resp.text:
+                    cleaned_summary = resp.text.replace("**", "").replace("*", "").strip()
+                    return True, f"I found {filename} ({char_count:,} characters). Here is the summary:\n\n{cleaned_summary}"
+            except Exception:
+                pass
+
+    if char_count <= 400:
+        return True, f"Content of {filename}:\n\n{content.strip()}"
+
+    excerpt = content[:300].strip().replace("\n", " ")
+    return True, f"I found {filename}. It contains {char_count:,} characters:\n\n\"{excerpt}...\""
+
+
+# =============================================================================
+# SYSTEM 4: REAL PDF EXTRACTION & SUMMARIZATION (via pypdf)
+# =============================================================================
+def extract_pdf_text(pdf_path: str, max_pages: int = 25, max_chars: int = 12000) -> Tuple[bool, str, int]:
+    """
+    Extracts real text from a PDF file using pypdf.
+    Returns (success, extracted_text, page_count).
+    """
+    if pypdf is None:
+        return False, "The pypdf library is not installed. Please run: pip install pypdf", 0
+
+    try:
+        reader = pypdf.PdfReader(pdf_path)
+        total_pages = len(reader.pages)
+        pages_to_read = min(total_pages, max_pages)
+        extracted_sections = []
+
+        for i in range(pages_to_read):
+            try:
+                page_text = reader.pages[i].extract_text()
+                if page_text and page_text.strip():
+                    extracted_sections.append(page_text.strip())
+            except Exception:
+                continue
+
+        full_text = "\n\n".join(extracted_sections).strip()
+        return True, full_text[:max_chars], total_pages
+    except Exception as e:
+        return False, str(e), 0
+
+
+def handle_read_pdf_command(raw_input: str) -> Tuple[bool, str]:
+    """
+    Locates, extracts text from, and summarizes PDF files.
+    Examples:
+    - 'Read my GST assignment PDF'
+    - 'Summarize my GST assignment'
+    - 'Find my resume PDF'
+    - 'Read test.pdf'
+    """
+    q = raw_input.lower().strip()
+    is_summarize = "summarize" in q or "summary" in q
+    is_read = "read" in q or is_summarize or "extract" in q
+
+    if not is_read and not ("pdf" in q and "find" not in q):
+        return False, ""
+
+    target_term, _, specific_folder = extract_search_target(raw_input)
+    if not target_term:
+        target_term = "pdf"
+
+    candidates = search_user_files(target_term, ".pdf", specific_folder, max_results=3)
+    if not candidates:
+        return True, f"I couldn't find any PDF matching '{target_term}' in your user folders."
+
+    pdf_path = candidates[0]
+    filename = os.path.basename(pdf_path)
+
+    success, text, page_count = extract_pdf_text(pdf_path)
+    if not success:
+        return True, f"Error extracting text from {filename}: {text}"
+
+    # Handle Scanned / Image-only PDFs
+    if not text or not text.strip():
+        return True, f"I found {filename} in {os.path.dirname(pdf_path)}, but it appears to be scanned or image-based. Text extraction wasn't available for this file."
+
+    char_count = len(text)
+
+    # Summarize with Gemini
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if api_key and genai is not None:
+        try:
+            client = genai.Client(api_key=api_key)
+            prompt = (
+                f"You are JARVIS. Provide a clear, professional 2-3 sentence summary of the following PDF document "
+                f"'{filename}' ({page_count} pages) suitable for speech output:\n\n{text[:8000]}"
+            )
+            resp = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=300),
+            )
+            if resp and resp.text:
+                summary = resp.text.replace("**", "").replace("*", "").strip()
+                return True, f"I extracted {filename} ({page_count} page{'s' if page_count > 1 else ''}, {char_count:,} characters):\n\n{summary}"
+        except Exception:
+            pass
+
+    excerpt = text[:350].strip().replace("\n", " ")
+    return True, f"I extracted {filename} ({page_count} pages, {char_count:,} characters):\n\n\"{excerpt}...\""
 
 
 # =============================================================================
@@ -528,7 +996,6 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
         if re.search(pattern, q):
             name = app_data.get("name", key.title())
 
-            # 1. Try URI scheme if defined (e.g. whatsapp:, spotify:, ms-settings:)
             if "uri" in app_data:
                 try:
                     os.system(f"start {app_data['uri']}")
@@ -536,7 +1003,6 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
                 except Exception:
                     pass
 
-            # 2. Try PATH binary
             cmd = app_data.get("cmd")
             if cmd and shutil.which(cmd):
                 try:
@@ -545,7 +1011,6 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
                 except Exception as e:
                     return True, f"Failed to launch {name}: {e}"
 
-            # 3. Try known absolute installation paths
             if key in KNOWN_APP_PATHS:
                 for path in KNOWN_APP_PATHS[key]:
                     if os.path.exists(path.split(" --")[0]):
@@ -555,7 +1020,6 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
                         except Exception as e:
                             return True, f"Failed to start {name}: {e}"
 
-            # 4. Try direct command with startfile
             if cmd:
                 try:
                     os.startfile(cmd)
@@ -563,7 +1027,6 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
                 except Exception:
                     pass
 
-            # 5. Fallback to Web version if available (e.g. WhatsApp Web / Spotify Web)
             if "web" in app_data:
                 try:
                     webbrowser.open(app_data["web"])
@@ -573,28 +1036,6 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
 
             return True, f"I couldn't find {name} installed on your system."
 
-    # Catch-all for generic 'open [app]' phrase
-    open_match = re.search(r"\b(?:open|launch|start)\s+([a-zA-Z0-9_\-]+)\b", q)
-    if open_match:
-        app_name = open_match.group(1).strip()
-        if app_name not in ["the", "my", "a", "an", "folder", "file", "time", "date", "cpu", "ram", "memory"]:
-            # Try PATH
-            if shutil.which(app_name):
-                try:
-                    subprocess.Popen([app_name], shell=True)
-                    return True, f"Opening {app_name.title()}."
-                except Exception:
-                    pass
-            # Try Windows URI protocol: start app_name:
-            try:
-                ret = os.system(f"start {app_name}: 2>nul")
-                if ret == 0:
-                    return True, f"Opening {app_name.title()}."
-            except Exception:
-                pass
-
-            return True, f"I couldn't find {app_name.title()} installed on your system."
-
     return False, ""
 
 
@@ -603,7 +1044,7 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
 # =============================================================================
 def get_user_directories() -> Dict[str, str]:
     """Returns safe standard Windows user directories."""
-    user_home = os.path.expanduser("~")
+    user_home = os.environ.get("USERPROFILE", os.path.expanduser("~"))
     return {
         "downloads": os.path.join(user_home, "Downloads"),
         "documents": os.path.join(user_home, "Documents"),
@@ -641,7 +1082,6 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
     """Controls system volume (Increase, Decrease, Mute, Unmute, Set %)."""
     q = query.lower()
 
-    # 1. Mute / Unmute
     if "mute" in q or "unmute" in q:
         try:
             ctypes.windll.user32.keybd_event(0xAD, 0, 0, 0)
@@ -650,7 +1090,6 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
         except Exception as e:
             return True, f"Failed to toggle volume mute: {e}"
 
-    # 2. Increase volume
     if any(p in q for p in ["increase volume", "volume up", "turn up volume", "raise volume", "louder"]):
         try:
             for _ in range(5):
@@ -660,7 +1099,6 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
         except Exception as e:
             return True, f"Failed to increase volume: {e}"
 
-    # 3. Decrease volume
     if any(p in q for p in ["decrease volume", "volume down", "lower volume", "turn down volume", "softer"]):
         try:
             for _ in range(5):
@@ -670,7 +1108,6 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
         except Exception as e:
             return True, f"Failed to decrease volume: {e}"
 
-    # 4. Set volume to X percent
     set_match = re.search(r"set\s+volume\s+to\s+(\d+)(?:\s*percent|\s*%)?", q)
     if set_match:
         percent = int(set_match.group(1))
@@ -699,193 +1136,6 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
             return True, f"Could not set volume: {e}"
 
     return False, ""
-
-
-# =============================================================================
-# FEATURE 5: SAFE FILE SEARCH
-# =============================================================================
-def handle_file_search(query: str) -> Tuple[bool, str]:
-    """
-    Searches for files in safe user directories (Desktop, Documents, Downloads, Pictures).
-    Examples:
-    - 'Find my Python files'
-    - 'Find resume.pdf'
-    - 'Find files named project'
-    - 'Search my Downloads for CSV files'
-    """
-    q = query.lower()
-    search_triggers = ["find", "search for file", "search for files", "search my", "locate file", "where is my file"]
-    if not any(q.startswith(trig) or f" {trig} " in f" {q} " for trig in search_triggers):
-        return False, ""
-
-    user_dirs = get_user_directories()
-    search_roots = [user_dirs["desktop"], user_dirs["documents"], user_dirs["downloads"], user_dirs["pictures"]]
-
-    if "download" in q:
-        search_roots = [user_dirs["downloads"]]
-    elif "document" in q:
-        search_roots = [user_dirs["documents"]]
-    elif "desktop" in q:
-        search_roots = [user_dirs["desktop"]]
-    elif "picture" in q:
-        search_roots = [user_dirs["pictures"]]
-
-    ext_map = {
-        "python": "*.py",
-        "py": "*.py",
-        "csv": "*.csv",
-        "pdf": "*.pdf",
-        "text": "*.txt",
-        "txt": "*.txt",
-        "json": "*.json",
-        "markdown": "*.md",
-        "word": "*.docx",
-        "excel": "*.xlsx",
-    }
-
-    target_pattern = None
-    for name, pattern in ext_map.items():
-        if f"{name} file" in q or f"{name} files" in q or q.endswith(f"for {name}"):
-            target_pattern = pattern
-            break
-
-    if not target_pattern:
-        named_match = re.search(
-            r"(?:find|search(?:\s+my\s+\w+)?\s+for)\s+(?:files?\s+named\s+|file\s+|files\s+)?([a-zA-Z0-9_\-\.]+)",
-            q,
-        )
-        if named_match:
-            candidate = named_match.group(1).strip()
-            if candidate and candidate not in ["files", "file", "my", "all"]:
-                if candidate in ext_map:
-                    target_pattern = ext_map[candidate]
-                else:
-                    target_pattern = f"*{candidate}*"
-
-    if not target_pattern:
-        return False, ""
-
-    matched_files = []
-    scanned_count = 0
-    max_scan = 500
-
-    for root_dir in search_roots:
-        if not os.path.exists(root_dir):
-            continue
-        try:
-            for root, dirs, files in os.walk(root_dir):
-                dirs[:] = [
-                    d for d in dirs
-                    if not d.startswith(".") and d.lower() not in ["appdata", "node_modules", ".git", "venv", "__pycache__"]
-                ]
-                rel_path = os.path.relpath(root, root_dir)
-                depth = len(rel_path.split(os.sep)) if rel_path != "." else 0
-                if depth > 3:
-                    dirs[:] = []
-                    continue
-
-                for f in files:
-                    scanned_count += 1
-                    if scanned_count > max_scan or len(matched_files) >= 5:
-                        break
-
-                    if target_pattern.startswith("*."):
-                        ext_suffix = target_pattern[1:].lower()
-                        if f.lower().endswith(ext_suffix):
-                            matched_files.append(os.path.join(root, f))
-                    else:
-                        clean_target = target_pattern.replace("*", "").lower()
-                        if clean_target in f.lower():
-                            matched_files.append(os.path.join(root, f))
-
-                if len(matched_files) >= 5 or scanned_count > max_scan:
-                    break
-        except Exception:
-            continue
-
-    if not matched_files:
-        return True, f"I couldn't find any matching files for {target_pattern} in your user folders."
-
-    count_str = f"I found {len(matched_files)} matching file{'s' if len(matched_files) > 1 else ''}:"
-    result_lines = [count_str]
-    for path in matched_files:
-        result_lines.append(f"• {path}")
-
-    return True, "\n".join(result_lines)
-
-
-# =============================================================================
-# FEATURE 6: READ TEXT FILES
-# =============================================================================
-SAFE_TEXT_EXTENSIONS = [".txt", ".csv", ".md", ".json", ".py", ".log", ".ini", ".env"]
-
-
-def handle_read_file(query: str) -> Tuple[bool, str]:
-    """
-    Safely reads and summarizes text-based files.
-    Example: 'Read my notes.txt' or 'Read file requirements.txt'
-    """
-    q = query.strip()
-    match = re.search(r"\bread\s+(?:my\s+|the\s+|file\s+)?([a-zA-Z0-9_\-\.\/\\]+)", q, re.IGNORECASE)
-    if not match:
-        return False, ""
-
-    filename = match.group(1).strip().rstrip(".,")
-    if filename.lower() in ["time", "date", "screen", "news"]:
-        return False, ""
-
-    user_dirs = get_user_directories()
-    candidate_paths = [
-        os.path.abspath(filename),
-        os.path.join(os.getcwd(), filename),
-        os.path.join(user_dirs["desktop"], filename),
-        os.path.join(user_dirs["documents"], filename),
-        os.path.join(user_dirs["downloads"], filename),
-    ]
-
-    target_path = None
-    for p in candidate_paths:
-        if os.path.isfile(p):
-            target_path = p
-            break
-
-    if not target_path:
-        for root_dir in [os.getcwd(), user_dirs["desktop"], user_dirs["documents"], user_dirs["downloads"]]:
-            found = glob.glob(os.path.join(root_dir, f"*{filename}*"))
-            if found and os.path.isfile(found[0]):
-                target_path = found[0]
-                break
-
-    if not target_path:
-        return True, f"I could not find the file '{filename}' in your project or user folders."
-
-    _, ext = os.path.splitext(target_path)
-    if ext.lower() not in SAFE_TEXT_EXTENSIONS:
-        return True, f"For security reasons, I only read safe text-based files ({', '.join(SAFE_TEXT_EXTENSIONS)})."
-
-    try:
-        with open(target_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read(3000)
-
-        if not content.strip():
-            return True, f"The file '{os.path.basename(target_path)}' is currently empty."
-
-        if len(content) < 200:
-            return True, f"Here is the content of {os.path.basename(target_path)}:\n{content.strip()}"
-
-        summary_prompt = (
-            f"Summarize the following contents of '{os.path.basename(target_path)}' in 2 concise, "
-            f"professional sentences suitable for speech synthesis:\n\n{content}"
-        )
-        ai_summary = ask_ai(summary_prompt)
-        if ai_summary and not ai_summary.startswith("I could not reach Gemini"):
-            return True, f"Summary of {os.path.basename(target_path)}: {ai_summary}"
-
-        excerpt = content[:250].strip().replace("\n", " ")
-        return True, f"Read {os.path.basename(target_path)}: {excerpt}..."
-
-    except Exception as e:
-        return True, f"Failed to read file: {e}"
 
 
 # =============================================================================
@@ -960,18 +1210,13 @@ class ChatBrain:
 
     def _get_contextual_instruction(self) -> str:
         """Injects stored user memories into the system prompt."""
-        mem = load_memory()
-        facts = mem.get("facts", {})
-        statements = mem.get("statements", [])
+        mem_data = load_memory()
+        memories = mem_data.get("memories", [])
 
         memory_context = ""
-        if facts or statements:
-            items = []
-            for k, v in facts.items():
-                items.append(f"{k}: {v}")
-            for st in statements[:5]:
-                items.append(st)
-            memory_context = f"\nUser Personal Context & Saved Memories:\n- " + "\n- ".join(items)
+        if memories:
+            items = [f"- {m['text']}" for m in memories[:10]]
+            memory_context = f"\nUser Personal Context & Saved Memories from jarvis_memory.json:\n" + "\n".join(items)
 
         return AI_SYSTEM_INSTRUCTION + memory_context
 
@@ -1007,7 +1252,7 @@ class ChatBrain:
         if self.chat_session is None:
             self._initialize_chat()
 
-        # 1. Try continuous chat session with conversation memory
+        # 1. Continuous chat session
         if self.chat_session is not None:
             try:
                 response = self.chat_session.send_message(prompt)
@@ -1020,7 +1265,7 @@ class ChatBrain:
             except Exception:
                 self.chat_session = None
 
-        # 2. Multi-model fallback
+        # 2. Fallback
         try:
             client = genai.Client(api_key=api_key)
             models_to_try = [
@@ -1209,15 +1454,16 @@ def handle_help() -> str:
     return (
         "JARVIS can currently:\n"
         "• Answer questions & converse using Gemini AI\n"
+        "• Remember & recall personal memories (jarvis_memory.json)\n"
+        "• Search user files & open matching documents\n"
+        "• Read and summarize text files (.txt, .md, .csv, .json)\n"
+        "• Extract and summarize PDF documents (via pypdf)\n"
         "• Open applications (Chrome, WhatsApp, VS Code, Spotify, etc.)\n"
         "• Open user folders (Downloads, Documents, Desktop, Pictures)\n"
         "• Search the web & open websites\n"
         "• Control system volume (Up, Down, Mute, Set %)\n"
         "• Check CPU and RAM performance\n"
-        "• Search files in user folders\n"
-        "• Read and summarize text files (.txt, .md, .py, .csv, .json)\n"
         "• Take screenshots & analyze your screen visually\n"
-        "• Remember personal details & retrieve stored memories\n"
         "• Perform safe mathematical calculations"
     )
 
@@ -1227,10 +1473,7 @@ def handle_system_status() -> str:
     ai_status = "Connected" if os.environ.get("GEMINI_API_KEY") else "Offline (No API Key)"
     mic_status = "Ready" if sr is not None else "Keyboard Mode"
     speaker_status = "Ready (Windows SAPI)" if WIN32COM_AVAILABLE else ("Ready (pyttsx3)" if pyttsx3 else "Text-only")
-    
-    mem = load_memory()
-    mem_count = len(mem.get("facts", {})) + len(mem.get("statements", []))
-    memory_status = f"Ready ({mem_count} items stored)"
+    mem_count = get_memory_count()
 
     cpu_str = f"{psutil.cpu_percent(interval=0.2)}%" if psutil else "N/A"
     ram_str = f"{psutil.virtual_memory().percent}%" if psutil else "N/A"
@@ -1241,7 +1484,7 @@ def handle_system_status() -> str:
         f"AI: {ai_status}\n"
         f"Microphone: {mic_status}\n"
         f"Speaker: {speaker_status}\n"
-        f"Memory: {memory_status}\n"
+        f"Memory: Ready ({mem_count} items stored)\n"
         f"CPU: {cpu_str}\n"
         f"RAM: {ram_str}\n"
         f"Current time: {time_str}"
@@ -1317,7 +1560,7 @@ def handle_screenshot() -> str:
         return "Pillow library is required to capture screenshots. Please run pip install Pillow."
 
     try:
-        pictures_dir = os.path.join(os.path.expanduser("~"), "Pictures")
+        pictures_dir = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), "Pictures")
         screenshots_dir = os.path.join(pictures_dir, "Screenshots")
         os.makedirs(screenshots_dir, exist_ok=True)
 
@@ -1369,7 +1612,7 @@ def is_exit_command(text: str) -> bool:
 
 def route_command(raw_input: str) -> Tuple[str, bool]:
     """
-    Main V2 command priority routing pipeline:
+    Main V2.1 command priority routing pipeline:
     1. Normalize text & strip wake word
     2. Check pending confirmation state
     3. Check exit / offline commands
@@ -1378,12 +1621,15 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
     6. Check volume control
     7. Check local commands (time, date, CPU, RAM, OS, screenshot)
     8. Check memory commands (remember, recall, forget, clear)
-    9. Check file search & read text files
-    10. Check folder control (Downloads, Documents, etc.)
-    11. Check web search & website opening
-    12. Check application control (Chrome, WhatsApp, VS Code, Spotify, etc.)
-    13. Check safe mathematical calculator
-    14. Fallback to Gemini AI Brain with rolling session history and personal memory context
+    9. Check PDF reading & summarization (via pypdf)
+    10. Check TXT / text file reading & summarization
+    11. Check open found file
+    12. Check user file search
+    13. Check folder control (Downloads, Documents, Desktop, etc.)
+    14. Check web search & website opening
+    15. Check application control (Chrome, WhatsApp, VS Code, Spotify, etc.)
+    16. Check safe mathematical calculator
+    17. Fallback to Gemini AI Brain with rolling session history and personal memory context
     Returns (response_text, should_exit)
     """
     global PENDING_CONFIRMATION
@@ -1420,7 +1666,7 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
     if prompt_lower in ["help", "what can you do", "show commands", "commands"]:
         return handle_help(), False
 
-    if any(p in prompt_lower for p in ["system status", "status report", "jarvis status", "about system status", "tell me about system status"]):
+    if any(p in prompt_lower for p in ["system status", "status report", "jarvis status", "about system status", "tell me about system status", "status"]):
         return handle_system_status(), False
 
     # 5. Screen Vision
@@ -1464,8 +1710,8 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
     if (
         prompt_lower.startswith("remember")
         or "remember that" in prompt_lower
-        or "remember my name" in prompt_lower
         or "save in memory" in prompt_lower
+        or "save to memory" in prompt_lower
     ):
         return handle_remember(prompt), False
 
@@ -1473,39 +1719,50 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
     if mem_resp:
         return mem_resp, False
 
-    # 11. Read Text Files
-    handled_read, read_resp = handle_read_file(prompt)
+    # 11. PDF Reading & Extraction (via pypdf) - if PDF or pdf mentioned
+    if "pdf" in prompt_lower or ".pdf" in prompt_lower:
+        handled_pdf, pdf_resp = handle_read_pdf_command(prompt)
+        if handled_pdf:
+            return pdf_resp, False
+
+    # 12. TXT / Text File Reading
+    handled_read, read_resp = handle_read_txt_command(prompt)
     if handled_read:
         return read_resp, False
 
-    # 12. File Search
-    handled_file_search, search_file_resp = handle_file_search(prompt)
+    # 13. Open Found File
+    handled_open_file, open_file_resp = handle_open_found_file(prompt)
+    if handled_open_file:
+        return open_file_resp, False
+
+    # 14. File Search across user folders
+    handled_file_search, search_file_resp = handle_file_search_command(prompt)
     if handled_file_search:
         return search_file_resp, False
 
-    # 13. Folder Control
+    # 15. Folder Control
     if "open" in prompt_lower or "launch" in prompt_lower or "explore" in prompt_lower:
         handled_folder, folder_resp = handle_open_folder(prompt_lower)
         if handled_folder:
             return folder_resp, False
 
-    # 14. Web Search
+    # 16. Web Search
     handled_search, search_resp = handle_search_web(prompt)
     if handled_search:
         return search_resp, False
 
-    # 15. Open Websites
+    # 17. Open Websites
     if "open" in prompt_lower or "launch" in prompt_lower or "start" in prompt_lower:
         handled_web, web_resp = handle_open_website(prompt_lower)
         if handled_web:
             return web_resp, False
 
-        # 16. Open Applications
+        # 18. Open Applications
         handled_app, app_resp = handle_open_app(prompt_lower)
         if handled_app:
             return app_resp, False
 
-    # 17. Safe Calculator
+    # 19. Safe Calculator
     if "calculate" in prompt_lower or "percent of" in prompt_lower or re.search(r"what is \d+", prompt_lower):
         math_candidate = re.sub(r"^(calculate|what is|how much is)\s*", "", prompt_lower, flags=re.IGNORECASE)
         math_candidate = math_candidate.rstrip("?.").strip()
@@ -1515,7 +1772,7 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
                 result = int(result)
             return f"The result is {result}.", False
 
-    # 18. Fallback to Gemini AI Brain
+    # 20. Fallback to Gemini AI Brain
     ai_response = ask_ai(prompt)
     return ai_response, False
 
@@ -1665,6 +1922,7 @@ def print_banner(ai_connected: bool, mic_ready: bool):
     """Displays the startup banner in the terminal matching V2 specifications."""
     ai_status = "CONNECTED" if ai_connected else "OFFLINE (Check .env)"
     voice_status = "READY" if mic_ready else "KEYBOARD MODE"
+    memory_count = get_memory_count()
 
     banner = f"""
 ========================================
@@ -1675,6 +1933,7 @@ STATUS: ONLINE
 AI: {ai_status}
 VOICE: {voice_status}
 MEMORY: READY
+MEMORIES: {memory_count}
 SYSTEM: READY
 ========================================
 """
