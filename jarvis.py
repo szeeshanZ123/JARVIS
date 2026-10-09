@@ -116,7 +116,7 @@ except ImportError:
     genai = None
     types = None
 
-# Windows COM Interface for native SAPI TTS
+# Optional Windows COM Interface for native SAPI TTS
 try:
     import pythoncom
     import win32com.client
@@ -125,14 +125,6 @@ except ImportError:
     pythoncom = None
     win32com = None
     WIN32COM_AVAILABLE = False
-
-# Optional pycaw for volume control
-try:
-    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
-    from comtypes import CLSCTX_ALL
-    PYCAW_AVAILABLE = True
-except ImportError:
-    PYCAW_AVAILABLE = False
 
 import collections
 
@@ -1229,15 +1221,16 @@ def handle_volume_control(query: str) -> Tuple[bool, str]:
         percent = int(set_match.group(1))
         percent = max(0, min(100, percent))
 
-        if PYCAW_AVAILABLE:
-            try:
-                devices = AudioUtilities.GetSpeakers()
-                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-                volume = ctypes.cast(interface, ctypes.POINTER(IAudioEndpointVolume))
-                volume.SetMasterVolumeLevelScalar(percent / 100.0, None)
-                return True, f"Volume set to {percent} percent."
-            except Exception:
-                pass
+        try:
+            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume  # type: ignore
+            from comtypes import CLSCTX_ALL  # type: ignore
+            devices = AudioUtilities.GetSpeakers()
+            interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            volume = ctypes.cast(interface, ctypes.POINTER(IAudioEndpointVolume))
+            volume.SetMasterVolumeLevelScalar(percent / 100.0, None)
+            return True, f"Volume set to {percent} percent."
+        except Exception:
+            pass
 
         try:
             for _ in range(50):
