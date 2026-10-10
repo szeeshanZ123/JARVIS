@@ -146,9 +146,30 @@ AI_SYSTEM_INSTRUCTION = (
 # MULTI-LAYER TEXT-TO-SPEECH (TTS) ENGINE
 # =============================================================================
 tts_lock = threading.Lock()
+TTS_STOP_REQUESTED = threading.Event()
+CURRENT_TTS_VOICE = None
+
+
+def stop_speaking() -> None:
+    """Immediately stops active speech synthesis."""
+    global TTS_STOP_REQUESTED, CURRENT_TTS_VOICE
+    TTS_STOP_REQUESTED.set()
+    if CURRENT_TTS_VOICE is not None:
+        try:
+            # SAPI purge
+            CURRENT_TTS_VOICE.Speak("", 2)
+        except Exception:
+            pass
 
 
 def speak(text: str) -> None:
+    """
+    Prints and speaks text reliably using Windows SAPI / pyttsx3 / PowerShell fallback.
+    Cleans markdown formatting and symbols so speech sounds natural.
+    Can be interrupted at any time via stop_speaking().
+    """
+    global TTS_STOP_REQUESTED, CURRENT_TTS_VOICE
+    TTS_STOP_REQUESTED.clear()
     """
     Prints and speaks text reliably using Windows SAPI / pyttsx3 / PowerShell fallback.
     Cleans markdown formatting and symbols so speech sounds natural.
@@ -175,7 +196,11 @@ def speak(text: str) -> None:
                 voice = win32com.client.Dispatch("SAPI.SpVoice")
                 voice.Rate = 0  # Standard conversational speed (-10 to +10)
                 voice.Volume = 100
-                voice.Speak(speech_text)
+                CURRENT_TTS_VOICE = voice
+                if TTS_STOP_REQUESTED.is_set():
+                    return
+                voice.Speak(speech_text, 0)
+                CURRENT_TTS_VOICE = None
                 return
             except Exception:
                 pass
@@ -512,35 +537,202 @@ context = ConversationContext()
 # =============================================================================
 # SYSTEM 2: COMPREHENSIVE WINDOWS USER FILE SEARCH & LAUNCHER
 # =============================================================================
-def get_user_search_roots() -> List[str]:
+def get_user_directories() -> Dict[str, str]:
     """
     Dynamically discovers all accessible user folders on Windows.
-    Desktop, Documents, Downloads, Pictures, Videos, Music, and OneDrive (if present).
+    Accounts for Windows folder redirection and OneDrive-backed Desktop/Documents/Videos folders.
     Never hardcodes usernames.
     """
     user_home = os.environ.get("USERPROFILE", os.path.expanduser("~"))
-    standard_folders = ["Desktop", "Documents", "Downloads", "Pictures", "Videos", "Music"]
+    onedrive_home = os.environ.get("OneDrive", os.path.join(user_home, "OneDrive"))
+
+    dirs: Dict[str, str] = {}
+
+    # 1. Query Windows Registry for redirected User Shell Folders (exact active paths)
+    try:
+        import winreg
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+        )
+        mapping = {
+            "Desktop": "desktop",
+            "Personal": "documents",
+            "{374DE290-123F-4565-9164-39C4925E467B}": "downloads",
+            "My Pictures": "pictures",
+            "My Video": "videos",
+            "My Music": "music"
+        }
+        for reg_name, label in mapping.items():
+            try:
+                val, _ = winreg.QueryValueEx(key, reg_name)
+                exp = os.path.expandvars(val)
+                if os.path.isdir(exp):
+                    dirs[label] = exp
+            except Exception:
+                pass
+        winreg.CloseKey(key)
+    except Exception:
+        pass
+
+    # 2. Fill standard fallbacks if missing or unredirected
+    fallbacks = {
+        "downloads": os.path.join(user_home, "Downloads"),
+        "documents": os.path.join(user_home, "Documents"),
+        "desktop": os.path.join(user_home, "Desktop"),
+        "pictures": os.path.join(user_home, "Pictures"),
+        "videos": os.path.join(user_home, "Videos"),
+        "music": os.path.join(user_home, "Music"),
+    }
+    for label, path in fallbacks.items():
+        if label not in dirs or not os.path.isdir(dirs[label]):
+            if os.path.isdir(path):
+                dirs[label] = path
+
+    # 3. Add OneDrive if available
+    if os.path.isdir(onedrive_home):
+        dirs["onedrive"] = onedrive_home
+
+    return dirs
+
+
+def get_user_search_roots() -> List[str]:
+    """
+    Dynamically discovers all accessible user folders on Windows.
+    Desktop, Documents, Downloads, Pictures, Videos, Music, and OneDrive.
+    Includes active redirected folders first.
+    """
+    user_dirs = get_user_directories()
     roots = []
 
     # Current working directory first for instant project files match
     cwd = os.getcwd()
     roots.append(cwd)
 
-    for folder in standard_folders:
-        path = os.path.join(user_home, folder)
+    for path in user_dirs.values():
         if os.path.isdir(path) and path not in roots:
             roots.append(path)
 
-    # Check OneDrive
-    onedrive_path = os.environ.get("OneDrive", os.path.join(user_home, "OneDrive"))
-    if os.path.isdir(onedrive_path) and onedrive_path not in roots:
-        roots.append(onedrive_path)
-        for folder in ["Desktop", "Documents", "Pictures"]:
-            sub = os.path.join(onedrive_path, folder)
-            if os.path.isdir(sub) and sub not in roots:
-                roots.append(sub)
+    # Add standard subfolders of OneDrive if present
+    onedrive_home = user_dirs.get("onedrive")
+    if onedrive_home and os.path.isdir(onedrive_home):
+        for sub in ["Desktop", "Documents", "Attachments", "Videos", "Pictures"]:
+            sub_path = os.path.join(onedrive_home, sub)
+            if os.path.isdir(sub_path) and sub_path not in roots:
+                roots.append(sub_path)
 
     return roots
+
+
+def list_folder_contents(folder_name_or_path: str, max_items: int = 15) -> Tuple[bool, str]:
+    """
+    Lists directory contents cleanly with types and file sizes.
+    Handles non-existent folders, permissions, and formatted output.
+    """
+    user_dirs = get_user_directories()
+    target_path = None
+    folder_clean = folder_name_or_path.strip().lower()
+
+    # Match predefined known folder
+    for name, path in user_dirs.items():
+        if folder_clean == name or folder_clean in name or name in folder_clean:
+            target_path = path
+            break
+
+    if not target_path:
+        if os.path.isabs(folder_name_or_path) and os.path.isdir(folder_name_or_path):
+            target_path = folder_name_or_path
+        else:
+            rel = os.path.abspath(folder_name_or_path)
+            if os.path.isdir(rel):
+                target_path = rel
+
+    if not target_path or not os.path.exists(target_path):
+        return False, f"The folder '{folder_name_or_path}' does not exist on your computer."
+
+    try:
+        entries = os.listdir(target_path)
+    except PermissionError:
+        return False, f"Access to '{target_path}' was denied by Windows permissions."
+    except Exception as e:
+        return False, f"Could not access '{target_path}': {e}"
+
+    if not entries:
+        return True, f"The folder '{os.path.basename(target_path)}' ({target_path}) is empty."
+
+    # Categorize and format
+    subdirs = []
+    files = []
+    for item in entries:
+        if item.startswith("."):
+            continue
+        full = os.path.join(target_path, item)
+        if os.path.isdir(full):
+            subdirs.append(f"[FOLDER] {item}")
+        elif os.path.isfile(full):
+            try:
+                sz = os.path.getsize(full)
+                sz_str = f"{round(sz / 1024, 1)} KB" if sz < 1024 * 1024 else f"{round(sz / (1024 * 1024), 2)} MB"
+                files.append(f"{item} ({sz_str})")
+            except Exception:
+                files.append(item)
+
+    total_count = len(subdirs) + len(files)
+    display_items = subdirs[:max_items // 2] + files[:max_items - len(subdirs[:max_items // 2])]
+
+    report = [f"Files and folders in {os.path.basename(target_path)} ({target_path}):"]
+    for i, item in enumerate(display_items, 1):
+        report.append(f"{i}. {item}")
+
+    if total_count > len(display_items):
+        report.append(f"...and {total_count - len(display_items)} more items.")
+
+    context.update(
+        last_intent="LIST_FOLDER",
+        last_location=os.path.basename(target_path),
+        last_found_files=[os.path.join(target_path, f.split(" (")[0]) for f in files[:10]]
+    )
+
+    return True, "\n".join(report)
+
+
+def handle_list_folder_command(raw_input: str) -> Tuple[bool, str]:
+    """
+    Handles natural language queries to list folder contents.
+    Examples:
+    - 'Jarvis, list files on my Desktop.'
+    - 'List files in Downloads.'
+    - 'What files are in my Documents?'
+    - 'Show files in Videos'
+    """
+    q = raw_input.lower().strip()
+    list_triggers = [
+        "list files on", "list files in", "list folder", "list my", "list the files in",
+        "what files are on", "what files are in", "show files in", "show files on",
+        "show me files in", "check files in", "check files on"
+    ]
+
+    matched_trigger = None
+    for trig in list_triggers:
+        if trig in q:
+            matched_trigger = trig
+            break
+
+    if not matched_trigger:
+        return False, ""
+
+    folder_candidate = q.split(matched_trigger, 1)[1].strip()
+    folder_candidate = re.sub(r"^(?:my|the)\s+", "", folder_candidate).strip()
+    folder_candidate = re.sub(r"\s+folder$", "", folder_candidate).strip().rstrip("?.,!")
+
+    if not folder_candidate:
+        if context.last_location:
+            folder_candidate = context.last_location
+        else:
+            return True, "Which folder would you like me to list?"
+
+    success, msg = list_folder_contents(folder_candidate)
+    return True, msg
 
 
 def search_user_files(
@@ -555,9 +747,14 @@ def search_user_files(
     """
     search_roots = get_user_search_roots()
     if specific_folder:
-        matched_roots = [r for r in search_roots if specific_folder.lower() in r.lower()]
-        if matched_roots:
-            search_roots = matched_roots
+        user_dirs = get_user_directories()
+        fld_key = specific_folder.lower()
+        if fld_key in user_dirs:
+            search_roots = [user_dirs[fld_key]]
+        else:
+            matched_roots = [r for r in search_roots if specific_folder.lower() in r.lower()]
+            if matched_roots:
+                search_roots = matched_roots
 
     matched_files: List[Tuple[int, str]] = []  # (score, path)
     scanned_count = 0
@@ -654,6 +851,10 @@ def extract_search_target(query: str, current_context: Optional[ConversationCont
             or f"from {fld}" in q_lower
             or f"my {fld}" in q_lower
             or f"under {fld}" in q_lower
+            or f"search {fld} for " in q_lower
+            or f"check {fld} for " in q_lower
+            or f"to {fld} and " in q_lower
+            or f"{fld} for " in q_lower
         ):
             specific_folder = fld.title()
             break
@@ -712,6 +913,7 @@ def extract_search_target(query: str, current_context: Optional[ConversationCont
     ).strip()
     
     clean_text = re.sub(r"\b(?:in|on|from|under)\s+(?:my\s+)?(?:downloads|documents|desktop|pictures|videos|music|onedrive|that\s+folder)\b", "", clean_text, flags=re.IGNORECASE).strip()
+    clean_text = re.sub(r"\b(?:my\s+)?(?:downloads|documents|desktop|pictures|videos|music|onedrive)\s+for\s+", "", clean_text, flags=re.IGNORECASE).strip()
     clean_text = re.sub(r"\b(?:there|in\s+there)\b", "", clean_text, flags=re.IGNORECASE).strip()
     clean_text = re.sub(r"\b(?:files?|pdf|txt|csv|docx?)\b", "", clean_text, flags=re.IGNORECASE).strip()
     clean_text = clean_text.rstrip("?.,").strip()
@@ -1145,17 +1347,6 @@ def handle_open_app(query: str) -> Tuple[bool, str]:
 # =============================================================================
 # FEATURE 3: SAFE FOLDER CONTROL
 # =============================================================================
-def get_user_directories() -> Dict[str, str]:
-    """Returns safe standard Windows user directories."""
-    user_home = os.environ.get("USERPROFILE", os.path.expanduser("~"))
-    return {
-        "downloads": os.path.join(user_home, "Downloads"),
-        "documents": os.path.join(user_home, "Documents"),
-        "pictures": os.path.join(user_home, "Pictures"),
-        "desktop": os.path.join(user_home, "Desktop"),
-        "music": os.path.join(user_home, "Music"),
-        "videos": os.path.join(user_home, "Videos"),
-    }
 
 
 def handle_open_folder(query: str) -> Tuple[bool, str]:
@@ -1978,14 +2169,16 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
         return handle_date(), False
 
     # 8. System Diagnostics (CPU, RAM, OS)
-    if "cpu" in prompt_lower:
-        return handle_system_info("cpu"), False
+    is_search_intent = any(prompt_lower.startswith(x) for x in ["search", "find", "locate", "where", "read", "open", "list"])
+    if not is_search_intent:
+        if re.search(r"\b(?:cpu\s+usage|cpu\s+load|check\s+cpu|current\s+cpu)\b", prompt_lower) or prompt_lower in ["cpu", "check cpu"]:
+            return handle_system_info("cpu"), False
 
-    if "ram" in prompt_lower and not ("program" in prompt_lower or "frame" in prompt_lower):
-        return handle_system_info("ram"), False
+        if (re.search(r"\b(?:ram\s+usage|check\s+ram|current\s+ram)\b", prompt_lower) or prompt_lower in ["ram", "check ram"]) and not ("program" in prompt_lower or "frame" in prompt_lower):
+            return handle_system_info("ram"), False
 
-    if any(p in prompt_lower for p in ["operating system", "what os", "which os"]):
-        return handle_system_info("os"), False
+        if re.search(r"\b(?:what\s+is\s+my\s+operating\s+system|what\s+is\s+my\s+os|what\s+os|which\s+os|check\s+os)\b", prompt_lower) or prompt_lower in ["operating system", "os"]:
+            return handle_system_info("os"), False
 
     # 9. Screenshot
     if "screenshot" in prompt_lower or "screen capture" in prompt_lower:
@@ -2020,6 +2213,11 @@ def route_command(raw_input: str) -> Tuple[str, bool]:
     handled_web, web_resp = handle_open_website(prompt_lower)
     if handled_web:
         return web_resp, False
+
+    # 12.5. Directory Listing ('list files on Desktop', 'list files in Downloads', etc.)
+    handled_list, list_resp = handle_list_folder_command(prompt)
+    if handled_list:
+        return list_resp, False
 
     # 13. Explicit Folder Opening ('open downloads', 'open desktop', 'open documents', etc.)
     handled_folder, folder_resp = handle_open_folder(prompt_lower)
@@ -2306,3 +2504,18 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def get_system_telemetry() -> Dict[str, Any]:
+    """Provides real-time hardware, voice, AI, and memory metrics for the GUI."""
+    cpu_percent = psutil.cpu_percent(interval=0) if psutil else 0.0
+    ram_percent = psutil.virtual_memory().percent if psutil else 0.0
+    ai_status = "CONNECTED" if os.environ.get("GEMINI_API_KEY") else "OFFLINE"
+    mem_count = get_memory_count()
+    return {
+        "cpu": cpu_percent,
+        "ram": ram_percent,
+        "ai_status": ai_status,
+        "memory_count": mem_count,
+        "active_location": context.last_location or "System",
+        "last_intent": context.last_intent or "IDLE",
+    }
